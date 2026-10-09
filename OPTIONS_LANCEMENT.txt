@@ -1,0 +1,48 @@
+DÉTECTEUR CRYPTO H24 - OPTIONS DE LANCEMENT
+===========================================
+
+Interface graphique (par défaut)
+--------------------------------
+  - Double-clic sur predict.exe (aucune console ne s'ouvre), ou :
+        predict.exe
+
+Mode console
+------------
+  predict.exe --console [--mode <MODE>] [options]
+
+  --console            Lance en mode console, sans interface graphique
+  --mode <MODE>        temps-reel (défaut) | simulation | periode | fichier
+  --debut AAAA-MM-JJ   Date de début           (requis avec --mode periode)
+  --fin AAAA-MM-JJ     Date de fin, incluse    (requis avec --mode periode)
+  --fichier <chemin>   Fichier JSON de bougies (requis avec --mode fichier)
+  --config <chemin>    Fichier de configuration (défaut : config.toml)
+  -h, --help           Affiche l'aide
+  -V, --version        Affiche la version
+
+  --mode, --debut, --fin et --fichier ne fonctionnent qu'avec --console.
+
+Exemples
+--------
+  Suivi en direct sur Binance (Ctrl+C pour arrêter) :
+        predict.exe --console
+
+  Simulation locale (prix fictifs) :
+        predict.exe --console --mode simulation
+
+  Test sur une période (télécharge les données Binance, les enregistre dans
+  historique_<début>_<fin>.json, puis affiche les alertes) :
+        predict.exe --console --mode periode --debut 2026-04-01 --fin 2026-04-03
+
+  Rejeu d'un fichier JSON enregistré :
+        predict.exe --console --mode fichier --fichier historique_2026-04-01_2026-04-03.json
+
+  Autre fichier de configuration :
+        predict.exe --console --config autre.toml
+
+Remarques
+---------
+  - config.toml est lu dans le dossier courant : lancez l'exe depuis le dossier
+    qui le contient (un double-clic le fait automatiquement).
+  - Les modes periode et fichier se terminent seuls ; le code de sortie est
+    différent de 0 en cas d'erreur.
+  - En mode graphique, il n'y a pas de logs console.

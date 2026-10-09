@@ -1,0 +1,26 @@
+[pairs]
+symbols = ["BTCEUR", "ETHEUR", "XRPEUR", "SOLEUR"]
+
+[timeframes]
+execution = "1h"
+
+[strategy]
+min_score_alert = 80
+
+[strategy.macro_filter]
+ema_period = 200
+use_supertrend = true
+supertrend_period = 10
+supertrend_multiplier = 3.0
+
+[strategy.adx]
+period = 14
+min_threshold = 22.0
+
+[strategy.volume]
+sma_period = 20
+multiplier = 1.2
+
+[network]
+rate_limit_ms = 200
+proxy = "http://127.0.0.1:9000"
