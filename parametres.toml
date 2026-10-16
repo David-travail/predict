@@ -1,0 +1,91 @@
+[strategy]
+min_score_alert = 80
+timeframe = "1h"
+
+[strategy.macro_filter]
+ema_period = 200
+use_supertrend = true
+supertrend_period = 10
+supertrend_multiplier = 3.0
+
+[strategy.adx]
+period = 14
+min_threshold = 22.0
+
+[strategy.volume]
+sma_period = 20
+multiplier = 1.2
+
+[groups]
+
+[overrides.BTCEUR]
+min_score_alert = 80
+timeframe = "1h"
+
+[overrides.BTCEUR.macro_filter]
+ema_period = 200
+use_supertrend = true
+supertrend_period = 10
+supertrend_multiplier = 3.0
+
+[overrides.BTCEUR.adx]
+period = 14
+min_threshold = 22.0
+
+[overrides.BTCEUR.volume]
+sma_period = 20
+multiplier = 1.2
+
+[overrides.ETHEUR]
+min_score_alert = 80
+timeframe = "1h"
+
+[overrides.ETHEUR.macro_filter]
+ema_period = 200
+use_supertrend = true
+supertrend_period = 10
+supertrend_multiplier = 3.0
+
+[overrides.ETHEUR.adx]
+period = 14
+min_threshold = 22.0
+
+[overrides.ETHEUR.volume]
+sma_period = 20
+multiplier = 1.2
+
+[overrides.SOLEUR]
+min_score_alert = 80
+timeframe = "1h"
+
+[overrides.SOLEUR.macro_filter]
+ema_period = 200
+use_supertrend = true
+supertrend_period = 10
+supertrend_multiplier = 3.0
+
+[overrides.SOLEUR.adx]
+period = 14
+min_threshold = 22.0
+
+[overrides.SOLEUR.volume]
+sma_period = 20
+multiplier = 1.2
+
+[overrides.XRPEUR]
+min_score_alert = 80
+timeframe = "1h"
+
+[overrides.XRPEUR.macro_filter]
+ema_period = 200
+use_supertrend = true
+supertrend_period = 10
+supertrend_multiplier = 3.0
+
+[overrides.XRPEUR.adx]
+period = 14
+min_threshold = 22.0
+
+[overrides.XRPEUR.volume]
+sma_period = 20
+multiplier = 1.2

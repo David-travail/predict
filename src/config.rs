@@ -1,6 +1,7 @@
 //! Parsing et validation de la configuration de l'application à partir de `config.toml`.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fs;
 use std::path::Path;
@@ -16,6 +17,12 @@ pub struct ConfigurationApplication {
     pub strategie: ConfigurationStrategie,
     #[serde(rename = "network")]
     pub reseau: ConfigurationReseau,
+    /// Blocs de paires (`[groups.<nom>]`), chacun avec son paramétrage optionnel.
+    #[serde(rename = "groups", default)]
+    pub groupes: BTreeMap<String, ConfigurationGroupe>,
+    /// Paramétrage propre à une paire (`[overrides.<SYMBOLE>]`).
+    #[serde(rename = "overrides", default)]
+    pub surcharges: BTreeMap<String, ConfigurationStrategie>,
 }
 
 /// Liste des paires/symboles à surveiller (section `[pairs]`).
@@ -33,7 +40,7 @@ pub struct ConfigurationUnitesTemps {
 }
 
 /// Configuration de la stratégie (section `[strategy]` et ses sous-tables).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConfigurationStrategie {
     #[serde(rename = "min_score_alert")]
     pub score_min_alerte: u32,
@@ -41,10 +48,17 @@ pub struct ConfigurationStrategie {
     pub filtre_macro: ConfigurationMacro,
     pub adx: ConfigurationAdx,
     pub volume: ConfigurationVolume,
+    /// Période des bougies (ex. `1h`) propre à ce paramétrage.
+    #[serde(rename = "timeframe", default = "unite_temps_defaut")]
+    pub unite_temps: String,
+}
+
+fn unite_temps_defaut() -> String {
+    "1h".to_string()
 }
 
 /// Filtre macro basé sur l'EMA / Supertrend (section `[strategy.macro_filter]`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConfigurationMacro {
     #[serde(rename = "ema_period")]
     pub periode_ema: u32,
@@ -68,7 +82,7 @@ fn multiplicateur_supertrend_defaut() -> f64 {
 }
 
 /// Configuration de l'indicateur ADX (section `[strategy.adx]`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConfigurationAdx {
     #[serde(rename = "period")]
     pub periode: u32,
@@ -77,7 +91,7 @@ pub struct ConfigurationAdx {
 }
 
 /// Configuration du filtre de volume (section `[strategy.volume]`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConfigurationVolume {
     #[serde(rename = "sma_period")]
     pub periode_moyenne_mobile: u32,
@@ -136,41 +150,238 @@ impl ConfigurationApplication {
             return Err("'timeframes.execution' ne peut pas être vide".into());
         }
 
-        if self.strategie.score_min_alerte > 100 {
-            return Err("'strategy.min_score_alert' doit être compris entre 0 et 100".into());
-        }
+        self.parametrages().valider()
+    }
 
-        if self.strategie.filtre_macro.periode_ema == 0 {
-            return Err("'strategy.macro_filter.ema_period' doit être supérieur à 0".into());
+    /// Paramétrages issus de `config.toml` : générique, blocs de paires et surcharges par paire.
+    pub fn parametrages(&self) -> Parametrages {
+        let mut generique = self.strategie.clone();
+        generique.unite_temps = self.unites_temps.unite_execution.clone();
+        Parametrages {
+            generique,
+            groupes: self.groupes.clone(),
+            paires: self
+                .surcharges
+                .iter()
+                .map(|(k, v)| (k.to_uppercase(), v.clone()))
+                .collect(),
         }
+    }
+}
 
-        if self.strategie.filtre_macro.periode_supertrend == 0 {
-            return Err("'strategy.macro_filter.supertrend_period' doit être supérieur à 0".into());
+impl ConfigurationStrategie {
+    /// Valide les valeurs ; `chemin` préfixe les messages (ex. `strategy`, `groups.alts.strategy`).
+    pub fn valider(&self, chemin: &str) -> Result<(), Box<dyn Error>> {
+        if self.unite_temps.trim().is_empty() {
+            return Err(format!("'{chemin}.timeframe' ne peut pas être vide").into());
         }
-
-        if self.strategie.filtre_macro.multiplicateur_supertrend <= 0.0 {
+        if self.score_min_alerte > 100 {
             return Err(
-                "'strategy.macro_filter.supertrend_multiplier' doit être strictement positif"
-                    .into(),
+                format!("'{chemin}.min_score_alert' doit être compris entre 0 et 100").into(),
             );
         }
-
-        if self.strategie.adx.periode == 0 {
-            return Err("'strategy.adx.period' doit être supérieur à 0".into());
+        if self.filtre_macro.periode_ema == 0 {
+            return Err(
+                format!("'{chemin}.macro_filter.ema_period' doit être supérieur à 0").into(),
+            );
         }
-
-        if self.strategie.adx.seuil_minimal < 0.0 {
-            return Err("'strategy.adx.min_threshold' ne peut pas être négatif".into());
+        if self.filtre_macro.periode_supertrend == 0 {
+            return Err(format!(
+                "'{chemin}.macro_filter.supertrend_period' doit être supérieur à 0"
+            )
+            .into());
         }
-
-        if self.strategie.volume.periode_moyenne_mobile == 0 {
-            return Err("'strategy.volume.sma_period' doit être supérieur à 0".into());
+        if self.filtre_macro.multiplicateur_supertrend <= 0.0 {
+            return Err(format!(
+                "'{chemin}.macro_filter.supertrend_multiplier' doit être strictement positif"
+            )
+            .into());
         }
-
-        if self.strategie.volume.multiplicateur <= 0.0 {
-            return Err("'strategy.volume.multiplier' doit être strictement positif".into());
+        if self.adx.periode == 0 {
+            return Err(format!("'{chemin}.adx.period' doit être supérieur à 0").into());
         }
+        if self.adx.seuil_minimal < 0.0 {
+            return Err(format!("'{chemin}.adx.min_threshold' ne peut pas être négatif").into());
+        }
+        if self.volume.periode_moyenne_mobile == 0 {
+            return Err(format!("'{chemin}.volume.sma_period' doit être supérieur à 0").into());
+        }
+        if self.volume.multiplicateur <= 0.0 {
+            return Err(
+                format!("'{chemin}.volume.multiplier' doit être strictement positif").into(),
+            );
+        }
+        Ok(())
+    }
+}
 
+/// Bloc de paires partageant un même paramétrage (section `[groups.<nom>]`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ConfigurationGroupe {
+    #[serde(rename = "symbols")]
+    pub symboles: Vec<String>,
+    /// Paramétrage du bloc ; à défaut, celui du générique.
+    #[serde(rename = "strategy", default, skip_serializing_if = "Option::is_none")]
+    pub strategie: Option<ConfigurationStrategie>,
+}
+
+/// Portée d'un paramétrage, de la plus large à la plus précise.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Portee {
+    Generique,
+    Groupe(String),
+    Paire(String),
+}
+
+/// Ensemble des paramétrages : priorité paire > bloc > générique.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Parametrages {
+    #[serde(rename = "strategy")]
+    pub generique: ConfigurationStrategie,
+    #[serde(rename = "groups", default)]
+    pub groupes: BTreeMap<String, ConfigurationGroupe>,
+    #[serde(rename = "overrides", default)]
+    pub paires: BTreeMap<String, ConfigurationStrategie>,
+}
+
+impl Parametrages {
+    /// Donne à chaque paire son propre réglage (copie de celui dont elle hérite) si elle n'en a pas.
+    pub fn completer(&mut self, symboles: &[String]) {
+        for symbole in symboles {
+            let cle = symbole.to_uppercase();
+            if !self.paires.contains_key(&cle) {
+                let s = self.resoudre(&cle).clone();
+                self.paires.insert(cle, s);
+            }
+        }
+    }
+
+    /// Copie le réglage d'une portée vers les paires qu'elle couvre (toutes pour le générique).
+    pub fn propager(&mut self, portee: &Portee, symboles: &[String]) {
+        let source = self.lire(portee);
+        let cibles: Vec<String> = match portee {
+            Portee::Generique => symboles.to_vec(),
+            Portee::Groupe(nom) => self
+                .groupes
+                .get(nom)
+                .map(|g| g.symboles.clone())
+                .unwrap_or_default(),
+            Portee::Paire(_) => Vec::new(),
+        };
+        for symbole in cibles {
+            self.paires.insert(symbole.to_uppercase(), source.clone());
+        }
+    }
+
+    /// Symboles regroupés par période, pour ouvrir un flux par période.
+    pub fn par_unite(&self, symboles: &[String]) -> BTreeMap<String, Vec<String>> {
+        let mut groupes: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for s in symboles {
+            groupes
+                .entry(self.resoudre(s).unite_temps.clone())
+                .or_default()
+                .push(s.clone());
+        }
+        groupes
+    }
+
+    /// Paramétrage effectif d'une paire.
+    pub fn resoudre(&self, symbole: &str) -> &ConfigurationStrategie {
+        let symbole = symbole.to_uppercase();
+        if let Some(s) = self.paires.get(&symbole) {
+            return s;
+        }
+        self.groupes
+            .values()
+            .filter(|g| g.symboles.iter().any(|x| x.eq_ignore_ascii_case(&symbole)))
+            .find_map(|g| g.strategie.as_ref())
+            .unwrap_or(&self.generique)
+    }
+
+    /// Paramétrage affiché pour une portée (hérité si elle n'a pas de réglage propre).
+    pub fn lire(&self, portee: &Portee) -> ConfigurationStrategie {
+        match portee {
+            Portee::Generique => self.generique.clone(),
+            Portee::Groupe(nom) => self
+                .groupes
+                .get(nom)
+                .and_then(|g| g.strategie.clone())
+                .unwrap_or_else(|| self.generique.clone()),
+            Portee::Paire(symbole) => self.resoudre(symbole).clone(),
+        }
+    }
+
+    pub fn ecrire(&mut self, portee: &Portee, strategie: ConfigurationStrategie) {
+        match portee {
+            Portee::Generique => self.generique = strategie,
+            Portee::Groupe(nom) => {
+                if let Some(g) = self.groupes.get_mut(nom) {
+                    g.strategie = Some(strategie);
+                }
+            }
+            Portee::Paire(symbole) => {
+                self.paires.insert(symbole.to_uppercase(), strategie);
+            }
+        }
+    }
+
+    /// Supprime le réglage propre d'une portée (le générique ne peut pas être supprimé).
+    pub fn reinitialiser(&mut self, portee: &Portee) {
+        match portee {
+            Portee::Generique => {}
+            Portee::Groupe(nom) => {
+                if let Some(g) = self.groupes.get_mut(nom) {
+                    g.strategie = None;
+                }
+            }
+            Portee::Paire(symbole) => {
+                self.paires.remove(&symbole.to_uppercase());
+            }
+        }
+    }
+
+    pub fn a_un_reglage_propre(&self, portee: &Portee) -> bool {
+        match portee {
+            Portee::Generique => true,
+            Portee::Groupe(nom) => self.groupes.get(nom).is_some_and(|g| g.strategie.is_some()),
+            Portee::Paire(symbole) => self.paires.contains_key(&symbole.to_uppercase()),
+        }
+    }
+
+    pub fn valider(&self) -> Result<(), Box<dyn Error>> {
+        self.generique.valider("strategy")?;
+        for (nom, groupe) in &self.groupes {
+            if let Some(s) = &groupe.strategie {
+                s.valider(&format!("groups.{nom}.strategy"))?;
+            }
+        }
+        for (symbole, s) in &self.paires {
+            s.valider(&format!("overrides.{symbole}"))?;
+        }
+        Ok(())
+    }
+
+    /// Charge une sauvegarde de paramétrages.
+    pub fn charger(chemin: &Path) -> Result<Self, Box<dyn Error>> {
+        let contenu = fs::read_to_string(chemin)?;
+        let mut parametrages: Self = toml::from_str(&contenu).map_err(|erreur| {
+            format!(
+                "Erreur de parsing TOML dans '{}': {erreur}",
+                chemin.display()
+            )
+        })?;
+        parametrages.paires = parametrages
+            .paires
+            .into_iter()
+            .map(|(k, v)| (k.to_uppercase(), v))
+            .collect();
+        parametrages.valider()?;
+        Ok(parametrages)
+    }
+
+    pub fn sauvegarder(&self, chemin: &Path) -> Result<(), Box<dyn Error>> {
+        self.valider()?;
+        fs::write(chemin, toml::to_string_pretty(self)?)?;
         Ok(())
     }
 }
@@ -220,7 +431,10 @@ mod tests {
         assert!(configuration.strategie.filtre_macro.utiliser_supertrend);
         assert_eq!(configuration.strategie.filtre_macro.periode_supertrend, 10);
         assert_eq!(
-            configuration.strategie.filtre_macro.multiplicateur_supertrend,
+            configuration
+                .strategie
+                .filtre_macro
+                .multiplicateur_supertrend,
             3.0
         );
         assert_eq!(configuration.strategie.adx.periode, 14);
@@ -233,6 +447,57 @@ mod tests {
         let mut configuration: ConfigurationApplication = toml::from_str(toml_exemple()).unwrap();
         configuration.paires.symboles.clear();
         assert!(configuration.valider().is_err());
+    }
+
+    #[test]
+    fn priorite_paire_puis_bloc_puis_generique() {
+        let mut configuration: ConfigurationApplication = toml::from_str(toml_exemple()).unwrap();
+        let mut bloc = configuration.strategie.clone();
+        bloc.adx.periode = 20;
+        configuration.groupes.insert(
+            "majeures".into(),
+            ConfigurationGroupe {
+                symboles: vec!["BTCUSDT".into()],
+                strategie: Some(bloc),
+            },
+        );
+        let mut paire = configuration.strategie.clone();
+        paire.adx.periode = 30;
+        configuration.surcharges.insert("btcusdt".into(), paire);
+        let p = configuration.parametrages();
+        assert_eq!(p.resoudre("BTCUSDT").adx.periode, 30);
+        let mut p2 = p.clone();
+        p2.reinitialiser(&Portee::Paire("BTCUSDT".into()));
+        assert_eq!(p2.resoudre("BTCUSDT").adx.periode, 20);
+        assert_eq!(p2.resoudre("ETHUSDT").adx.periode, 14);
+    }
+
+    #[test]
+    fn chaque_paire_recoit_son_propre_reglage() {
+        let configuration: ConfigurationApplication = toml::from_str(toml_exemple()).unwrap();
+        let mut p = configuration.parametrages();
+        p.completer(&configuration.paires.symboles);
+        assert_eq!(p.paires.len(), 2);
+        p.generique.adx.periode = 99;
+        assert_eq!(p.resoudre("BTCUSDT").adx.periode, 14);
+        p.propager(&Portee::Generique, &configuration.paires.symboles);
+        assert_eq!(p.resoudre("ETHUSDT").adx.periode, 99);
+    }
+
+    #[test]
+    fn sauvegarde_et_rechargement() {
+        let configuration: ConfigurationApplication = toml::from_str(toml_exemple()).unwrap();
+        let mut p = configuration.parametrages();
+        p.ecrire(&Portee::Paire("ETHUSDT".into()), {
+            let mut s = p.generique.clone();
+            s.volume.multiplicateur = 2.0;
+            s
+        });
+        let chemin = std::env::temp_dir().join("predict_parametres_test.toml");
+        p.sauvegarder(&chemin).unwrap();
+        let relu = Parametrages::charger(&chemin).unwrap();
+        let _ = std::fs::remove_file(&chemin);
+        assert_eq!(relu, p);
     }
 
     #[test]

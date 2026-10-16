@@ -1,6 +1,7 @@
-use crate::config::ConfigurationStrategie;
+use crate::config::{ConfigurationStrategie, Parametrages, Portee};
 use crate::core::modeles::Tendance;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::Instant;
 use tokio::sync::mpsc::{Receiver, UnboundedReceiver, UnboundedSender};
 
@@ -22,8 +23,7 @@ pub enum CommandeMoteur {
         date_debut: String,
         date_fin: String,
         chemin_fichier: String,
-        unite: String,
-        strategie: ConfigurationStrategie,
+        parametrages: Parametrages,
     },
 }
 
@@ -72,7 +72,6 @@ pub struct ApplicationCryptobot {
     pub rx_mpsc: Receiver<SignalVisuel>,
     pub paires: HashMap<String, SignalVisuel>,
     pub journal_alertes: Vec<SignalVisuel>,
-    pub score_seuil: u8,
 
     // Nouveaux champs pour le choix du mode et le calibrage
     pub mode_actif: ModeExecution,
@@ -80,9 +79,11 @@ pub struct ApplicationCryptobot {
     pub date_fin: String,
     pub chemin_fichier_test: String,
     /// Paramètres de calcul modifiables ; envoyés au moteur à chaque (re)lancement.
-    pub strategie: ConfigurationStrategie,
-    /// Unité de temps des bougies (ex. `1h`) ; envoyée au moteur à chaque (re)lancement.
-    pub unite: String,
+    pub parametrages: Parametrages,
+    /// Portée (générique, bloc ou paire) actuellement éditée.
+    portee: Portee,
+    symboles: Vec<String>,
+    chemin_parametrages: PathBuf,
     pub generation: u64,
     pub statut: String,
     /// Alerte cliquée dans le journal : sa paire affiche les données de cette alerte.
@@ -97,17 +98,18 @@ pub struct ApplicationCryptobot {
 impl ApplicationCryptobot {
     pub fn new(
         rx_mpsc: Receiver<SignalVisuel>,
-        strategie: ConfigurationStrategie,
-        unite: String,
+        parametrages: Parametrages,
+        symboles: Vec<String>,
+        chemin_parametrages: PathBuf,
     ) -> Self {
-        let score_seuil = strategie.score_min_alerte.min(100) as u8;
         Self {
-            strategie,
-            unite,
+            parametrages,
+            portee: Portee::Generique,
+            symboles,
+            chemin_parametrages,
             rx_mpsc,
             paires: HashMap::new(),
             journal_alertes: Vec::new(),
-            score_seuil,
             mode_actif: ModeExecution::TempsReel,
             date_debut: "2026-01-01".to_string(),
             date_fin: "2026-02-01".to_string(),
@@ -166,18 +168,60 @@ impl ApplicationCryptobot {
     }
 
     fn lancer(&self) {
-        let mut strategie = self.strategie.clone();
-        strategie.score_min_alerte = self.score_seuil as u32;
         self.envoyer(CommandeMoteur::Demarrer {
             generation: self.generation,
             mode: self.mode_actif,
             date_debut: self.date_debut.clone(),
             date_fin: self.date_fin.clone(),
             chemin_fichier: self.chemin_fichier_test.clone(),
-            unite: self.unite.clone(),
-            strategie,
+            parametrages: self.parametrages.clone(),
         });
     }
+}
+
+/// Champs d'édition des indicateurs d'un paramétrage (utilisés par la barre et par chaque carte).
+fn editeur_indicateurs(ui: &mut egui::Ui, s: &mut ConfigurationStrategie) {
+    ui.label("Période");
+    egui::ComboBox::from_id_source(ui.id().with("unite_temps"))
+        .selected_text(s.unite_temps.as_str())
+        .width(60.0)
+        .show_ui(ui, |ui| {
+            for u in UNITES_TEMPS {
+                ui.selectable_value(&mut s.unite_temps, u.to_string(), *u);
+            }
+        });
+    ui.separator();
+    ui.label("EMA période");
+    ui.add(egui::DragValue::new(&mut s.filtre_macro.periode_ema).clamp_range(2..=1000));
+    ui.checkbox(&mut s.filtre_macro.utiliser_supertrend, "Supertrend");
+    ui.add_enabled_ui(s.filtre_macro.utiliser_supertrend, |ui| {
+        ui.label("ATR période");
+        ui.add(egui::DragValue::new(&mut s.filtre_macro.periode_supertrend).clamp_range(1..=100));
+        ui.label("×");
+        ui.add(
+            egui::DragValue::new(&mut s.filtre_macro.multiplicateur_supertrend)
+                .clamp_range(0.1..=10.0)
+                .speed(0.05),
+        );
+    });
+    ui.separator();
+    ui.label("ADX période");
+    ui.add(egui::DragValue::new(&mut s.adx.periode).clamp_range(2..=100));
+    ui.label("seuil");
+    ui.add(
+        egui::DragValue::new(&mut s.adx.seuil_minimal)
+            .clamp_range(1.0..=100.0)
+            .speed(0.5),
+    );
+    ui.separator();
+    ui.label("Volume SMA");
+    ui.add(egui::DragValue::new(&mut s.volume.periode_moyenne_mobile).clamp_range(2..=500));
+    ui.label("×");
+    ui.add(
+        egui::DragValue::new(&mut s.volume.multiplicateur)
+            .clamp_range(0.1..=10.0)
+            .speed(0.05),
+    );
 }
 
 impl eframe::App for ApplicationCryptobot {
@@ -273,13 +317,6 @@ impl eframe::App for ApplicationCryptobot {
                             "📁 Fichier Local (JSON)",
                         );
                     });
-
-                // Réglage dynamique du seuil d'alerte
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.add(
-                        egui::Slider::new(&mut self.score_seuil, 0..=100).text("Seuil d'alerte"),
-                    );
-                });
             });
 
             // Barre de sous-menu dynamique pour le Backtest / Test
@@ -319,59 +356,88 @@ impl eframe::App for ApplicationCryptobot {
 
             // Paramètres de calcul : appliqués par « Appliquer » (relance le mode courant)
             ui.separator();
+            let mut sauvegarder = false;
+            let mut heriter = false;
+            let mut propager = false;
             ui.horizontal_wrapped(|ui| {
-                let s = &mut self.strategie;
-                ui.label("Période");
-                egui::ComboBox::from_id_source("unite_temps")
-                    .selected_text(self.unite.as_str())
-                    .width(60.0)
+                ui.label("Paramétrage :");
+                let libelle = |p: &Portee| match p {
+                    Portee::Generique => "Générique".to_string(),
+                    Portee::Groupe(nom) => format!("Bloc {nom}"),
+                    Portee::Paire(symbole) => format!("Paire {symbole}"),
+                };
+                egui::ComboBox::from_id_source("portee")
+                    .selected_text(libelle(&self.portee))
                     .show_ui(ui, |ui| {
-                        for u in UNITES_TEMPS {
-                            ui.selectable_value(&mut self.unite, u.to_string(), *u);
+                        ui.selectable_value(&mut self.portee, Portee::Generique, "Générique");
+                        for nom in self.parametrages.groupes.keys() {
+                            let p = Portee::Groupe(nom.clone());
+                            let texte = libelle(&p);
+                            ui.selectable_value(&mut self.portee, p, texte);
+                        }
+                        for symbole in &self.symboles {
+                            let p = Portee::Paire(symbole.to_uppercase());
+                            let texte = libelle(&p);
+                            ui.selectable_value(&mut self.portee, p, texte);
                         }
                     });
+                if self.portee != Portee::Generique {
+                    let propre = self.parametrages.a_un_reglage_propre(&self.portee);
+                    ui.label(if propre {
+                        "(réglage propre)"
+                    } else {
+                        "(hérité)"
+                    });
+                    if ui
+                        .add_enabled(propre, egui::Button::new("↺ Hériter"))
+                        .clicked()
+                    {
+                        heriter = true;
+                    }
+                }
+                if !matches!(self.portee, Portee::Paire(_)) {
+                    if ui
+                        .button("⇊ Copier vers les paires")
+                        .on_hover_text("Écrase le réglage propre des paires concernées")
+                        .clicked()
+                    {
+                        propager = true;
+                    }
+                }
+                if ui.button("💾 Sauvegarder").clicked() {
+                    sauvegarder = true;
+                }
+            });
+            if heriter {
+                self.parametrages.reinitialiser(&self.portee);
+            }
+            if propager {
+                self.parametrages.propager(&self.portee, &self.symboles);
+            }
+            if sauvegarder {
+                self.statut = match self.parametrages.sauvegarder(&self.chemin_parametrages) {
+                    Ok(()) => format!(
+                        "💾 Paramétrages sauvegardés : {}",
+                        self.chemin_parametrages.display()
+                    ),
+                    Err(erreur) => format!("❌ Sauvegarde impossible : {erreur}"),
+                };
+            }
+
+            let mut s = self.parametrages.lire(&self.portee);
+            let avant = s.clone();
+            ui.horizontal_wrapped(|ui| {
+                ui.add(egui::Slider::new(&mut s.score_min_alerte, 0..=100).text("Seuil d'alerte"));
                 ui.separator();
-                ui.label("EMA période");
-                ui.add(egui::DragValue::new(&mut s.filtre_macro.periode_ema).clamp_range(2..=1000));
-                ui.checkbox(&mut s.filtre_macro.utiliser_supertrend, "Supertrend");
-                ui.add_enabled_ui(s.filtre_macro.utiliser_supertrend, |ui| {
-                    ui.label("ATR période");
-                    ui.add(
-                        egui::DragValue::new(&mut s.filtre_macro.periode_supertrend)
-                            .clamp_range(1..=100),
-                    );
-                    ui.label("×");
-                    ui.add(
-                        egui::DragValue::new(&mut s.filtre_macro.multiplicateur_supertrend)
-                            .clamp_range(0.1..=10.0)
-                            .speed(0.05),
-                    );
-                });
-                ui.separator();
-                ui.label("ADX période");
-                ui.add(egui::DragValue::new(&mut s.adx.periode).clamp_range(2..=100));
-                ui.label("seuil");
-                ui.add(
-                    egui::DragValue::new(&mut s.adx.seuil_minimal)
-                        .clamp_range(1.0..=100.0)
-                        .speed(0.5),
-                );
-                ui.separator();
-                ui.label("Volume SMA");
-                ui.add(
-                    egui::DragValue::new(&mut s.volume.periode_moyenne_mobile).clamp_range(2..=500),
-                );
-                ui.label("×");
-                ui.add(
-                    egui::DragValue::new(&mut s.volume.multiplicateur)
-                        .clamp_range(0.1..=10.0)
-                        .speed(0.05),
-                );
+                editeur_indicateurs(ui, &mut s);
                 ui.separator();
                 if ui.button("✔ Appliquer").clicked() {
                     lancer_test = true;
                 }
             });
+            if s != avant {
+                self.parametrages.ecrire(&self.portee, s);
+            }
         });
 
         if self.mode_actif != mode_avant {
@@ -412,15 +478,13 @@ impl eframe::App for ApplicationCryptobot {
                                             .color(egui::Color32::GOLD),
                                     );
                                     ui.label(format!("Prix: {}", formater_prix(alerte.prix)));
-                                    ui.label(
-                                        egui::RichText::new(alerte.tendance.libelle()).color(
-                                            if alerte.tendance == Tendance::Haussiere {
-                                                egui::Color32::GREEN
-                                            } else {
-                                                egui::Color32::LIGHT_RED
-                                            },
-                                        ),
-                                    );
+                                    ui.label(egui::RichText::new(alerte.tendance.libelle()).color(
+                                        if alerte.tendance == Tendance::Haussiere {
+                                            egui::Color32::GREEN
+                                        } else {
+                                            egui::Color32::LIGHT_RED
+                                        },
+                                    ));
                                     ui.label(format!("ADX: {:.1}", alerte.adx));
                                     ui.label(format!("Vol Ratio: {:.2}x", alerte.ratio_volume));
                                     ui.label(
@@ -458,12 +522,16 @@ impl eframe::App for ApplicationCryptobot {
             ui.separator();
 
             let mut retour_direct = false;
+            let mut appliquer = false;
+            let mut modifications: Vec<(String, ConfigurationStrategie)> = Vec::new();
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     for (symbole, signal_courant) in &self.paires {
                         let alerte_affichee =
                             self.selection.as_ref().filter(|s| s.symbole == *symbole);
                         let signal = alerte_affichee.unwrap_or(signal_courant);
+                        let mut strat = self.parametrages.resoudre(symbole).clone();
+                        let strat_initiale = strat.clone();
                         ui.group(|ui| {
                             ui.set_width(280.0);
                             ui.vertical(|ui| {
@@ -534,12 +602,12 @@ impl eframe::App for ApplicationCryptobot {
                                      Utilité : ne retenir que les mouvements alignés sur la tendance. \
                                      Neutre = score 0.\n\
                                      Poids dans le score : 40 pts.",
-                                    self.strategie.filtre_macro.periode_ema,
-                                    if self.strategie.filtre_macro.utiliser_supertrend {
+                                    strat.filtre_macro.periode_ema,
+                                    if strat.filtre_macro.utiliser_supertrend {
                                         format!(
                                             ", confirmée par le Supertrend (ATR {} × {}) de même sens",
-                                            self.strategie.filtre_macro.periode_supertrend,
-                                            self.strategie.filtre_macro.multiplicateur_supertrend
+                                            strat.filtre_macro.periode_supertrend,
+                                            strat.filtre_macro.multiplicateur_supertrend
                                         )
                                     } else {
                                         String::new()
@@ -555,8 +623,8 @@ impl eframe::App for ApplicationCryptobot {
                                              Valide si ADX ≥ {:.0}.\n\
                                              Utilité : écarter les marchés sans direction (range) où les signaux sont peu fiables.\n\
                                              Poids dans le score : 30 pts.",
-                                            self.strategie.adx.periode,
-                                            self.strategie.adx.seuil_minimal
+                                            strat.adx.periode,
+                                            strat.adx.seuil_minimal
                                         ));
                                     if signal.adx_valide {
                                         ui.label(
@@ -581,8 +649,8 @@ impl eframe::App for ApplicationCryptobot {
                                          Cassure si le ratio dépasse {:.2}x.\n\
                                          Utilité : confirmer qu'un mouvement est soutenu par une vraie participation du marché.\n\
                                          Poids dans le score : 30 pts.",
-                                        self.strategie.volume.periode_moyenne_mobile,
-                                        self.strategie.volume.multiplicateur
+                                        strat.volume.periode_moyenne_mobile,
+                                        strat.volume.multiplicateur
                                     ));
                                     if signal.volume_valide {
                                         ui.label(
@@ -604,11 +672,11 @@ impl eframe::App for ApplicationCryptobot {
                                     .on_hover_text(
                                         "Somme des critères : Macro 40 + ADX 30 + Volume 30.\n\
                                          Score à 0 si la tendance de fond est neutre.\n\
-                                         Alerte si le score atteint le seuil d'alerte réglé en haut à droite.",
+                                         Alerte si le score atteint le seuil d'alerte réglé dans la barre de paramètres.",
                                     );
 
                                 let ratio_score = (signal.score as f32) / 100.0;
-                                let couleur_barre = if signal.score >= self.score_seuil {
+                                let couleur_barre = if signal.score >= strat.score_min_alerte.min(100) as u8 {
                                     egui::Color32::GREEN
                                 } else if signal.score >= 50 {
                                     egui::Color32::YELLOW
@@ -621,11 +689,40 @@ impl eframe::App for ApplicationCryptobot {
                                         .fill(couleur_barre)
                                         .animate(signal.est_alerte),
                                 );
+
+                                egui::CollapsingHeader::new("⚙ Paramètres de la paire")
+                                    .id_source(("params", symbole))
+                                    .show(ui, |ui| {
+                                        ui.horizontal_wrapped(|ui| {
+                                            ui.add(
+                                                egui::Slider::new(
+                                                    &mut strat.score_min_alerte,
+                                                    0..=100,
+                                                )
+                                                .text("Seuil"),
+                                            );
+                                            editeur_indicateurs(ui, &mut strat);
+                                        });
+                                        if ui.button("✔ Appliquer").clicked() {
+                                            appliquer = true;
+                                        }
+                                    });
                             });
                         });
+                        if strat != strat_initiale {
+                            modifications.push((symbole.clone(), strat));
+                        }
                     }
                 });
             });
+            for (symbole, strat) in modifications {
+                self.parametrages.ecrire(&Portee::Paire(symbole), strat);
+            }
+            if appliquer {
+                self.reinitialiser();
+                self.statut = "Chargement en cours...".to_string();
+                self.lancer();
+            }
             if retour_direct {
                 self.selection = None;
             }

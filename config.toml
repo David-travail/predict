@@ -24,3 +24,22 @@ multiplier = 1.2
 [network]
 rate_limit_ms = 200
 proxy = "http://127.0.0.1:9000"
+
+# Bloc de paires : paramétrage commun (optionnel) ; priorité : paire > bloc > [strategy].
+# [groups.majeures]
+# symbols = ["BTCEUR", "ETHEUR"]
+# [groups.majeures.strategy]
+# min_score_alert = 75
+# [groups.majeures.strategy.macro_filter]
+# ema_period = 100
+# use_supertrend = true
+# [groups.majeures.strategy.adx]
+# period = 14
+# min_threshold = 20.0
+# [groups.majeures.strategy.volume]
+# sma_period = 20
+# multiplier = 1.2
+
+# Paramétrage propre à une paire : [overrides.SOLEUR] avec les mêmes sous-tables que [strategy].
+
+# Les réglages modifiés dans l'IHM sont sauvegardés dans parametres.toml (prioritaire sur ce fichier).

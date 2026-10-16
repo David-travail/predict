@@ -8,7 +8,7 @@ mod data;
 mod indicators;
 mod ui;
 
-use crate::config::{ConfigurationApplication, ConfigurationStrategie};
+use crate::config::{ConfigurationApplication, ConfigurationStrategie, Parametrages};
 use crate::core::modeles::{AnalyseTechnique, Bougie, Tendance};
 use crate::core::scoring::calculer_score;
 use crate::data::rest::{telecharger_bougies_periode, telecharger_plage_bougies};
@@ -95,6 +95,38 @@ fn charger_configuration(
     }
 }
 
+/// Fichier de sauvegarde des paramétrages, à côté du fichier de configuration.
+fn chemin_parametrages(demandee: Option<&PathBuf>) -> PathBuf {
+    demandee
+        .cloned()
+        .or_else(chercher_config)
+        .and_then(|c| c.parent().map(|p| p.join("parametres.toml")))
+        .unwrap_or_else(|| PathBuf::from("parametres.toml"))
+}
+
+/// Paramétrages de config.toml, remplacés par la sauvegarde si elle existe et est valide.
+fn charger_parametrages(
+    config: &ConfigurationApplication,
+    chemin: &std::path::Path,
+) -> Parametrages {
+    let mut parametrages = if chemin.is_file() {
+        match Parametrages::charger(chemin) {
+            Ok(p) => {
+                info!("Paramétrages chargés : {}", chemin.display());
+                p
+            }
+            Err(erreur) => {
+                error!("Sauvegarde ignorée : {erreur}");
+                config.parametrages()
+            }
+        }
+    } else {
+        config.parametrages()
+    };
+    parametrages.completer(&config.paires.symboles);
+    parametrages
+}
+
 /// Rattache le processus à la console du terminal qui l'a lancé, pour que `println!`, les logs
 /// et `--help` s'affichent malgré le sous-système « windows ».
 #[cfg(windows)]
@@ -174,8 +206,10 @@ fn executer(_avec_arguments: bool) -> Result<(), Box<dyn std::error::Error>> {
     info!("Paires surveillées : {:?}", config.paires.symboles);
     crate::data::reseau::definir_proxy(config.reseau.proxy.clone());
 
-    let strategie_ui = config.strategie.clone();
-    let unite_ui = config.unites_temps.unite_execution.clone();
+    let chemin_parametrages = chemin_parametrages(arguments.config.as_ref());
+    let parametrages = charger_parametrages(&config, &chemin_parametrages);
+    let parametrages_ui = parametrages.clone();
+    let symboles_ui = config.paires.symboles.clone();
 
     // Le moteur tourne sur la runtime Tokio ; egui occupe le thread principal.
     let runtime = tokio::runtime::Runtime::new()?;
@@ -201,8 +235,7 @@ fn executer(_avec_arguments: bool) -> Result<(), Box<dyn std::error::Error>> {
         date_debut,
         date_fin,
         chemin_fichier,
-        unite: config.unites_temps.unite_execution.clone(),
-        strategie: config.strategie.clone(),
+        parametrages,
     })?;
     runtime.spawn(moteur(Arc::new(config), tx_ui, tx_statut, rx_commandes));
 
@@ -222,8 +255,13 @@ fn executer(_avec_arguments: bool) -> Result<(), Box<dyn std::error::Error>> {
         options,
         Box::new(move |_cc| {
             Box::new(
-                ui::ApplicationCryptobot::new(rx_ui, strategie_ui, unite_ui)
-                    .avec_moteur(tx_commandes, rx_statut),
+                ui::ApplicationCryptobot::new(
+                    rx_ui,
+                    parametrages_ui,
+                    symboles_ui,
+                    chemin_parametrages,
+                )
+                .avec_moteur(tx_commandes, rx_statut),
             )
         }),
     )?;
@@ -306,8 +344,7 @@ struct Contexte {
     tx_ui: mpsc::Sender<SignalVisuel>,
     tx_statut: mpsc::UnboundedSender<(u64, String)>,
     generation: u64,
-    unite: String,
-    strategie: ConfigurationStrategie,
+    parametrages: Parametrages,
 }
 
 type Historiques = HashMap<String, Vec<Bougie>>;
@@ -332,8 +369,7 @@ async fn moteur(
             date_debut,
             date_fin,
             chemin_fichier,
-            unite,
-            strategie,
+            parametrages,
         } = commande
         else {
             continue;
@@ -344,8 +380,7 @@ async fn moteur(
             tx_ui: tx_ui.clone(),
             tx_statut: tx_statut.clone(),
             generation,
-            unite,
-            strategie,
+            parametrages,
         };
         session = Some(tokio::spawn(async move {
             let resultat = match mode {
@@ -374,13 +409,13 @@ impl Contexte {
     }
 
     async fn temps_reel(&self) -> Result<(), String> {
-        let unite = &self.unite;
         let symboles = &self.config.paires.symboles;
 
         self.statut("Téléchargement de l'historique Binance...");
         let mut historiques = Historiques::new();
         for symbole in symboles {
             info!("Téléchargement de l'historique Binance pour {}...", symbole);
+            let unite = &self.parametrages.resoudre(symbole).unite_temps;
             let mut bougies = telecharger_bougies_periode(
                 symbole,
                 unite,
@@ -407,16 +442,20 @@ impl Contexte {
         info!("Flux Binance lancé. Traitement en temps réel activé...");
 
         let (tx_bougies, rx_bougies) = mpsc::channel::<Bougie>(100);
-        let flux = ecouter_flux_temps_reel(symboles, unite, tx_bougies);
+        let mut flux = tokio::task::JoinSet::new();
+        for (unite, groupe) in self.parametrages.par_unite(symboles) {
+            let tx = tx_bougies.clone();
+            flux.spawn(async move { ecouter_flux_temps_reel(&groupe, &unite, tx).await });
+        }
+        drop(tx_bougies);
         tokio::select! {
-            _ = flux => {}
+            _ = flux.join_all() => {}
             _ = self.traiter_flux(&mut historiques, rx_bougies) => {}
         }
         Ok(())
     }
 
     async fn simulation(&self) -> Result<(), String> {
-        let unite = &self.unite;
         let symboles = &self.config.paires.symboles;
 
         let mut historiques: Historiques = symboles
@@ -424,7 +463,11 @@ impl Contexte {
             .map(|s| {
                 (
                     s.to_uppercase(),
-                    generer_historique_fictif(s, unite, BOUGIES_PRECHAUFFAGE),
+                    generer_historique_fictif(
+                        s,
+                        &self.parametrages.resoudre(s).unite_temps,
+                        BOUGIES_PRECHAUFFAGE,
+                    ),
                 )
             })
             .collect();
@@ -435,9 +478,14 @@ impl Contexte {
         self.statut("🟡 Simulation locale : prix fictifs");
 
         let (tx_bougies, rx_bougies) = mpsc::channel::<Bougie>(100);
-        let flux = simuler_flux_temps_reel(symboles, unite, tx_bougies);
+        let mut flux = tokio::task::JoinSet::new();
+        for (unite, groupe) in self.parametrages.par_unite(symboles) {
+            let tx = tx_bougies.clone();
+            flux.spawn(async move { simuler_flux_temps_reel(&groupe, &unite, tx).await });
+        }
+        drop(tx_bougies);
         tokio::select! {
-            _ = flux => {}
+            _ = flux.join_all() => {}
             _ = self.traiter_flux(&mut historiques, rx_bougies) => {}
         }
         Ok(())
@@ -446,13 +494,13 @@ impl Contexte {
     /// Télécharge sur Binance la plage `[debut, fin]` de chaque paire puis la rejoue bougie par bougie.
     async fn test_periode(&self, debut: &str, fin: &str) -> Result<(), String> {
         let (debut_ms, fin_ms) = plage_en_millisecondes(debut, fin)?;
-        let unite = &self.unite;
         let symboles = &self.config.paires.symboles;
 
         let mut historiques = Historiques::new();
         let mut rejeu = Vec::new();
         let mut sauvegarde: Vec<Bougie> = Vec::new();
         for (i, symbole) in symboles.iter().enumerate() {
+            let unite = &self.parametrages.resoudre(symbole).unite_temps;
             self.statut(format!(
                 "Téléchargement de {symbole} ({}/{}) du {debut} au {fin}...",
                 i + 1,
@@ -578,7 +626,7 @@ impl Contexte {
                 let signal = construire_signal(
                     historique,
                     derniere,
-                    &self.strategie,
+                    self.parametrages.resoudre(&derniere.symbole),
                     self.generation,
                     false,
                 );
@@ -613,7 +661,13 @@ impl Contexte {
             &provisoire
         };
 
-        let signal = construire_signal(serie, &bougie, &self.strategie, self.generation, rejeu);
+        let signal = construire_signal(
+            serie,
+            &bougie,
+            self.parametrages.resoudre(&bougie.symbole),
+            self.generation,
+            rejeu,
+        );
         let est_alerte = signal.est_alerte;
         self.tx_ui.send(signal).await.ok()?;
         Some(est_alerte)
