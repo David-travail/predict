@@ -22,7 +22,7 @@ use crate::ui::{CommandeMoteur, ModeExecution, SignalVisuel};
 
 use chrono::{Local, NaiveDate};
 use clap::{Parser, ValueEnum};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -235,6 +235,7 @@ fn executer(_avec_arguments: bool) -> Result<(), Box<dyn std::error::Error>> {
         date_debut,
         date_fin,
         chemin_fichier,
+        symboles_test: config.paires.symboles.clone(),
         parametrages,
     })?;
     runtime.spawn(moteur(Arc::new(config), tx_ui, tx_statut, rx_commandes));
@@ -369,6 +370,7 @@ async fn moteur(
             date_debut,
             date_fin,
             chemin_fichier,
+            symboles_test,
             parametrages,
         } = commande
         else {
@@ -386,8 +388,13 @@ async fn moteur(
             let resultat = match mode {
                 ModeExecution::TempsReel => ctx.temps_reel().await,
                 ModeExecution::Simulation => ctx.simulation().await,
-                ModeExecution::BacktestPeriode => ctx.test_periode(&date_debut, &date_fin).await,
-                ModeExecution::BacktestFichier => ctx.test_fichier(&chemin_fichier).await,
+                ModeExecution::BacktestPeriode => {
+                    ctx.test_periode(&date_debut, &date_fin, &symboles_test)
+                        .await
+                }
+                ModeExecution::BacktestFichier => {
+                    ctx.test_fichier(&chemin_fichier, &symboles_test).await
+                }
             };
             if let Err(erreur) = resultat {
                 error!("{erreur}");
@@ -492,9 +499,16 @@ impl Contexte {
     }
 
     /// Télécharge sur Binance la plage `[debut, fin]` de chaque paire puis la rejoue bougie par bougie.
-    async fn test_periode(&self, debut: &str, fin: &str) -> Result<(), String> {
+    async fn test_periode(
+        &self,
+        debut: &str,
+        fin: &str,
+        symboles: &[String],
+    ) -> Result<(), String> {
         let (debut_ms, fin_ms) = plage_en_millisecondes(debut, fin)?;
-        let symboles = &self.config.paires.symboles;
+        if symboles.is_empty() {
+            return Err("Sélectionnez au moins une paire à jouer.".into());
+        }
 
         let mut historiques = Historiques::new();
         let mut rejeu = Vec::new();
@@ -554,20 +568,21 @@ impl Contexte {
     }
 
     /// Rejoue un fichier JSON contenant une liste de bougies.
-    async fn test_fichier(&self, chemin: &str) -> Result<(), String> {
+    async fn test_fichier(&self, chemin: &str, symboles: &[String]) -> Result<(), String> {
         if !chemin.to_lowercase().ends_with(".json") {
             return Err("Seuls les fichiers JSON (liste de bougies) sont pris en charge".into());
+        }
+        if symboles.is_empty() {
+            return Err("Sélectionnez au moins une paire à jouer.".into());
         }
         self.statut(format!("Lecture de {chemin}..."));
 
         let contenu = tokio::fs::read_to_string(chemin)
             .await
             .map_err(|e| format!("Lecture de '{chemin}' impossible : {e}"))?;
-        let mut bougies: Vec<Bougie> = serde_json::from_str(&contenu)
+        let bougies: Vec<Bougie> = serde_json::from_str(&contenu)
             .map_err(|e| format!("Fichier '{chemin}' invalide : {e}"))?;
-        if bougies.is_empty() {
-            return Err(format!("Le fichier '{chemin}' ne contient aucune bougie"));
-        }
+        let mut bougies = filtrer_bougies_par_symboles(bougies, symboles, chemin)?;
         for bougie in &mut bougies {
             bougie.cloturee = true;
         }
@@ -674,6 +689,36 @@ impl Contexte {
     }
 }
 
+fn filtrer_bougies_par_symboles(
+    mut bougies: Vec<Bougie>,
+    symboles: &[String],
+    chemin: &str,
+) -> Result<Vec<Bougie>, String> {
+    if bougies.is_empty() {
+        return Err(format!("Le fichier '{chemin}' ne contient aucune bougie"));
+    }
+    if symboles.is_empty() {
+        return Err("Sélectionnez au moins une paire à jouer.".into());
+    }
+
+    let symboles_demandes: HashSet<String> = symboles.iter().map(|s| s.to_uppercase()).collect();
+    let symboles_fichier: HashSet<String> =
+        bougies.iter().map(|b| b.symbole.to_uppercase()).collect();
+    let absents: Vec<String> = symboles_demandes
+        .difference(&symboles_fichier)
+        .cloned()
+        .collect();
+    if !absents.is_empty() {
+        return Err(format!(
+            "Paire(s) absente(s) du fichier '{chemin}' : {}",
+            absents.join(", ")
+        ));
+    }
+
+    bougies.retain(|b| symboles_demandes.contains(&b.symbole.to_uppercase()));
+    Ok(bougies)
+}
+
 /// Convertit deux dates `AAAA-MM-JJ` en bornes UTC en millisecondes (fin incluse, jusqu'à 23:59:59.999).
 fn plage_en_millisecondes(debut: &str, fin: &str) -> Result<(i64, i64), String> {
     let lire = |texte: &str, nom: &str| {
@@ -764,9 +809,9 @@ fn construire_signal(
         bougie
             .instant_ouverture
             .with_timezone(&Local)
-            .format("%d/%m %H:%M")
+            .format("%d/%m/%Y %H:%M:%S")
     } else {
-        Local::now().format("%H:%M:%S")
+        Local::now().format("%d/%m/%Y %H:%M:%S")
     }
     .to_string();
 
@@ -793,6 +838,21 @@ fn construire_signal(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{TimeZone, Utc};
+
+    fn bougie_test(symbole: &str) -> Bougie {
+        Bougie {
+            symbole: symbole.to_string(),
+            unite_temps: "1d".to_string(),
+            instant_ouverture: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+            ouverture: 1.0,
+            haut: 1.0,
+            bas: 1.0,
+            cloture: 1.0,
+            volume: 1.0,
+            cloturee: true,
+        }
+    }
 
     #[test]
     fn convertit_la_plage_de_dates_en_millisecondes_utc() {
@@ -806,5 +866,38 @@ mod tests {
         assert!(plage_en_millisecondes("2026-02-01", "2026-01-01").is_err());
         assert!(plage_en_millisecondes("01/01/2026", "2026-01-02").is_err());
         assert!(plage_en_millisecondes("2026-01-01", "").is_err());
+    }
+
+    #[test]
+    fn filtre_le_fichier_local_selon_les_paires_selectionnees() {
+        let bougies = vec![
+            bougie_test("BTCEUR"),
+            bougie_test("ETHEUR"),
+            bougie_test("SOLEUR"),
+        ];
+        let selection = vec!["btceur".to_string(), "SOLEUR".to_string()];
+
+        let filtrees =
+            filtrer_bougies_par_symboles(bougies, &selection, "historique.json").unwrap();
+
+        assert_eq!(
+            filtrees
+                .iter()
+                .map(|b| b.symbole.as_str())
+                .collect::<Vec<_>>(),
+            vec!["BTCEUR", "SOLEUR"]
+        );
+    }
+
+    #[test]
+    fn signale_les_paires_selectionnees_absentes_du_fichier() {
+        let erreur = filtrer_bougies_par_symboles(
+            vec![bougie_test("BTCEUR")],
+            &["SOLEUR".to_string()],
+            "historique.json",
+        )
+        .unwrap_err();
+
+        assert!(erreur.contains("SOLEUR"));
     }
 }

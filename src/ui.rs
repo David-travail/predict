@@ -1,6 +1,7 @@
 use crate::config::{ConfigurationStrategie, Parametrages, Portee};
 use crate::core::modeles::Tendance;
-use std::collections::HashMap;
+use chrono::{Datelike, Duration, NaiveDate};
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Instant;
 use tokio::sync::mpsc::{Receiver, UnboundedReceiver, UnboundedSender};
@@ -23,6 +24,7 @@ pub enum CommandeMoteur {
         date_debut: String,
         date_fin: String,
         chemin_fichier: String,
+        symboles_test: Vec<String>,
         parametrages: Parametrages,
     },
 }
@@ -68,6 +70,116 @@ fn formater_prix(prix: f64) -> String {
     format!("{signe}{groupes}.{decimales}")
 }
 
+fn formater_paire(symbole: &str) -> String {
+    const DEVISES_FIAT: &[&str] = &[
+        "AED", "ARS", "AUD", "BRL", "CAD", "CHF", "CLP", "CNY", "CZK", "DKK", "EUR", "GBP", "HKD",
+        "HUF", "IDR", "ILS", "INR", "JPY", "KRW", "MXN", "MYR", "NOK", "NZD", "PHP", "PLN", "RON",
+        "RUB", "SAR", "SEK", "SGD", "THB", "TRY", "TWD", "UAH", "USD", "VND", "ZAR",
+    ];
+
+    DEVISES_FIAT
+        .iter()
+        .find_map(|devise| {
+            symbole
+                .strip_suffix(devise)
+                .filter(|crypto| !crypto.is_empty())
+                .map(|crypto| format!("{crypto} / {devise}"))
+        })
+        .unwrap_or_else(|| symbole.to_string())
+}
+
+fn afficher_calendrier(
+    ctx: &egui::Context,
+    titre: &str,
+    id: &str,
+    ouvert: &mut bool,
+    mois: &mut NaiveDate,
+    valeur: &mut String,
+) {
+    if !*ouvert {
+        return;
+    }
+
+    let mut date_choisie = None;
+    egui::Window::new(titre)
+        .id(egui::Id::new(id))
+        .open(ouvert)
+        .resizable(false)
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("‹").clicked() {
+                    *mois = if mois.month() == 1 {
+                        NaiveDate::from_ymd_opt(mois.year() - 1, 12, 1).unwrap()
+                    } else {
+                        NaiveDate::from_ymd_opt(mois.year(), mois.month() - 1, 1).unwrap()
+                    };
+                }
+                let noms_mois = [
+                    "janvier",
+                    "février",
+                    "mars",
+                    "avril",
+                    "mai",
+                    "juin",
+                    "juillet",
+                    "août",
+                    "septembre",
+                    "octobre",
+                    "novembre",
+                    "décembre",
+                ];
+                ui.label(format!(
+                    "{} {}",
+                    noms_mois[mois.month0() as usize],
+                    mois.year()
+                ));
+                if ui.button("›").clicked() {
+                    *mois = if mois.month() == 12 {
+                        NaiveDate::from_ymd_opt(mois.year() + 1, 1, 1).unwrap()
+                    } else {
+                        NaiveDate::from_ymd_opt(mois.year(), mois.month() + 1, 1).unwrap()
+                    };
+                }
+            });
+
+            let premier_jour = NaiveDate::from_ymd_opt(mois.year(), mois.month(), 1).unwrap();
+            let premier_jour_mois_suivant = if mois.month() == 12 {
+                NaiveDate::from_ymd_opt(mois.year() + 1, 1, 1).unwrap()
+            } else {
+                NaiveDate::from_ymd_opt(mois.year(), mois.month() + 1, 1).unwrap()
+            };
+            let dernier_jour = premier_jour_mois_suivant - Duration::days(1);
+            let selection_actuelle = NaiveDate::parse_from_str(valeur, "%Y-%m-%d").ok();
+            egui::Grid::new(id).num_columns(7).show(ui, |ui| {
+                for jour in ["Lu", "Ma", "Me", "Je", "Ve", "Sa", "Di"] {
+                    ui.strong(jour);
+                }
+                ui.end_row();
+
+                let decalage = premier_jour.weekday().num_days_from_monday();
+                for _ in 0..decalage {
+                    ui.label("");
+                }
+                for jour in 1..=dernier_jour.day() {
+                    let date = NaiveDate::from_ymd_opt(mois.year(), mois.month(), jour).unwrap();
+                    let bouton = egui::Button::new(jour.to_string())
+                        .selected(selection_actuelle == Some(date));
+                    if ui.add(bouton).clicked() {
+                        date_choisie = Some(date);
+                    }
+                    if date.weekday().num_days_from_monday() == 6 {
+                        ui.end_row();
+                    }
+                }
+            });
+        });
+
+    if let Some(date) = date_choisie {
+        *valeur = date.format("%Y-%m-%d").to_string();
+        *ouvert = false;
+    }
+}
+
 pub struct ApplicationCryptobot {
     pub rx_mpsc: Receiver<SignalVisuel>,
     pub paires: HashMap<String, SignalVisuel>,
@@ -77,12 +189,18 @@ pub struct ApplicationCryptobot {
     pub mode_actif: ModeExecution,
     pub date_debut: String,
     pub date_fin: String,
+    date_debut_mois: NaiveDate,
+    date_fin_mois: NaiveDate,
+    calendrier_debut_ouvert: bool,
+    calendrier_fin_ouvert: bool,
     pub chemin_fichier_test: String,
     /// Paramètres de calcul modifiables ; envoyés au moteur à chaque (re)lancement.
     pub parametrages: Parametrages,
     /// Portée (générique, bloc ou paire) actuellement éditée.
     portee: Portee,
     symboles: Vec<String>,
+    symboles_test_disponibles: Vec<String>,
+    symboles_test: HashSet<String>,
     chemin_parametrages: PathBuf,
     pub generation: u64,
     pub statut: String,
@@ -102,10 +220,24 @@ impl ApplicationCryptobot {
         symboles: Vec<String>,
         chemin_parametrages: PathBuf,
     ) -> Self {
+        let mut symboles_test_disponibles = symboles.clone();
+        symboles_test_disponibles.extend(parametrages.paires.keys().cloned());
+        for groupe in parametrages.groupes.values() {
+            symboles_test_disponibles.extend(groupe.symboles.iter().cloned());
+        }
+        symboles_test_disponibles = symboles_test_disponibles
+            .into_iter()
+            .map(|s| s.to_uppercase())
+            .collect();
+        symboles_test_disponibles.sort_unstable();
+        symboles_test_disponibles.dedup();
+
         Self {
             parametrages,
             portee: Portee::Generique,
+            symboles_test: symboles.iter().map(|s| s.to_uppercase()).collect(),
             symboles,
+            symboles_test_disponibles,
             chemin_parametrages,
             rx_mpsc,
             paires: HashMap::new(),
@@ -113,6 +245,10 @@ impl ApplicationCryptobot {
             mode_actif: ModeExecution::TempsReel,
             date_debut: "2026-01-01".to_string(),
             date_fin: "2026-02-01".to_string(),
+            date_debut_mois: NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+            date_fin_mois: NaiveDate::from_ymd_opt(2026, 2, 1).unwrap(),
+            calendrier_debut_ouvert: false,
+            calendrier_fin_ouvert: false,
             chemin_fichier_test: "historique.json".to_string(),
             generation: 0,
             statut: String::new(),
@@ -174,13 +310,128 @@ impl ApplicationCryptobot {
             date_debut: self.date_debut.clone(),
             date_fin: self.date_fin.clone(),
             chemin_fichier: self.chemin_fichier_test.clone(),
+            symboles_test: self
+                .symboles_test_disponibles
+                .iter()
+                .filter(|s| self.symboles_test.contains(&s.to_uppercase()))
+                .cloned()
+                .collect(),
             parametrages: self.parametrages.clone(),
         });
     }
 }
 
 /// Champs d'édition des indicateurs d'un paramétrage (utilisés par la barre et par chaque carte).
-fn editeur_indicateurs(ui: &mut egui::Ui, s: &mut ConfigurationStrategie) {
+fn editeur_indicateurs(
+    ui: &mut egui::Ui,
+    s: &mut ConfigurationStrategie,
+    disposition_verticale: bool,
+) {
+    if disposition_verticale {
+        ui.label("Période");
+        egui::ComboBox::from_id_source(ui.id().with("unite_temps"))
+            .selected_text(s.unite_temps.as_str())
+            .width(60.0)
+            .show_ui(ui, |ui| {
+                for u in UNITES_TEMPS {
+                    ui.selectable_value(&mut s.unite_temps, u.to_string(), *u);
+                }
+            });
+        ui.label("EMA période");
+        ui.add(egui::DragValue::new(&mut s.filtre_macro.periode_ema).clamp_range(2..=1000));
+        ui.checkbox(&mut s.filtre_macro.utiliser_supertrend, "Supertrend");
+        if s.filtre_macro.utiliser_supertrend {
+            ui.label("ATR période");
+            ui.add(
+                egui::DragValue::new(&mut s.filtre_macro.periode_supertrend).clamp_range(1..=100),
+            );
+            ui.label("Supertrend multiplicateur");
+            ui.add(
+                egui::DragValue::new(&mut s.filtre_macro.multiplicateur_supertrend)
+                    .clamp_range(0.1..=10.0)
+                    .speed(0.05),
+            );
+        }
+        ui.label("ADX période");
+        ui.add(egui::DragValue::new(&mut s.adx.periode).clamp_range(2..=100));
+        ui.label("ADX seuil");
+        ui.add(
+            egui::DragValue::new(&mut s.adx.seuil_minimal)
+                .clamp_range(1.0..=100.0)
+                .speed(0.5),
+        );
+        ui.label("Volume SMA (bougies)");
+        ui.add(egui::DragValue::new(&mut s.volume.periode_moyenne_mobile).clamp_range(2..=500));
+        ui.label("Multiplicateur volume");
+        ui.add(
+            egui::DragValue::new(&mut s.volume.multiplicateur)
+                .clamp_range(0.1..=10.0)
+                .speed(0.05)
+                .suffix("×"),
+        );
+        return;
+    }
+
+    if ui.available_width() < 500.0 {
+        ui.horizontal(|ui| {
+            ui.label("Période");
+            egui::ComboBox::from_id_source(ui.id().with("unite_temps"))
+                .selected_text(s.unite_temps.as_str())
+                .width(60.0)
+                .show_ui(ui, |ui| {
+                    for u in UNITES_TEMPS {
+                        ui.selectable_value(&mut s.unite_temps, u.to_string(), *u);
+                    }
+                });
+        });
+        ui.horizontal(|ui| {
+            ui.label("EMA période");
+            ui.add(egui::DragValue::new(&mut s.filtre_macro.periode_ema).clamp_range(2..=1000));
+        });
+        ui.checkbox(&mut s.filtre_macro.utiliser_supertrend, "Supertrend");
+        if s.filtre_macro.utiliser_supertrend {
+            ui.horizontal(|ui| {
+                ui.label("ATR période");
+                ui.add(
+                    egui::DragValue::new(&mut s.filtre_macro.periode_supertrend)
+                        .clamp_range(1..=100),
+                );
+                ui.label("×");
+                ui.add(
+                    egui::DragValue::new(&mut s.filtre_macro.multiplicateur_supertrend)
+                        .clamp_range(0.1..=10.0)
+                        .speed(0.05),
+                );
+            });
+        }
+        ui.horizontal(|ui| {
+            ui.label("ADX période");
+            ui.add(egui::DragValue::new(&mut s.adx.periode).clamp_range(2..=100));
+        });
+        ui.horizontal(|ui| {
+            ui.label("ADX seuil");
+            ui.add(
+                egui::DragValue::new(&mut s.adx.seuil_minimal)
+                    .clamp_range(1.0..=100.0)
+                    .speed(0.5),
+            );
+        });
+        ui.horizontal(|ui| {
+            ui.label("Volume SMA (bougies)");
+            ui.add(egui::DragValue::new(&mut s.volume.periode_moyenne_mobile).clamp_range(2..=500));
+        });
+        ui.horizontal(|ui| {
+            ui.label("Multiplicateur volume");
+            ui.add(
+                egui::DragValue::new(&mut s.volume.multiplicateur)
+                    .clamp_range(0.1..=10.0)
+                    .speed(0.05)
+                    .suffix("×"),
+            );
+        });
+        return;
+    }
+
     ui.label("Période");
     egui::ComboBox::from_id_source(ui.id().with("unite_temps"))
         .selected_text(s.unite_temps.as_str())
@@ -216,11 +467,12 @@ fn editeur_indicateurs(ui: &mut egui::Ui, s: &mut ConfigurationStrategie) {
     ui.separator();
     ui.label("Volume SMA");
     ui.add(egui::DragValue::new(&mut s.volume.periode_moyenne_mobile).clamp_range(2..=500));
-    ui.label("×");
+    ui.label("Multiplicateur");
     ui.add(
         egui::DragValue::new(&mut s.volume.multiplicateur)
             .clamp_range(0.1..=10.0)
-            .speed(0.05),
+            .speed(0.05)
+            .suffix("×"),
     );
 }
 
@@ -324,29 +576,78 @@ impl eframe::App for ApplicationCryptobot {
                 || self.mode_actif == ModeExecution::BacktestFichier
             {
                 ui.separator();
-                ui.horizontal(|ui| {
+                ui.vertical(|ui| {
                     if self.mode_actif == ModeExecution::BacktestPeriode {
-                        ui.label("Début (AAAA-MM-JJ) :");
-                        ui.text_edit_singleline(&mut self.date_debut);
-                        ui.label("Fin (AAAA-MM-JJ) :");
-                        ui.text_edit_singleline(&mut self.date_fin);
-                    } else {
-                        ui.label("Chemin fichier test :");
-                        ui.text_edit_singleline(&mut self.chemin_fichier_test);
-                        if ui.button("📂 Parcourir...").clicked() {
-                            let mut dialogue =
-                                rfd::FileDialog::new().add_filter("Historique JSON", &["json"]);
-                            if let Some(dossier) = std::path::Path::new(&self.chemin_fichier_test)
-                                .parent()
-                                .filter(|d| d.is_dir())
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("Début (AAAA-MM-JJ) :");
+                            ui.text_edit_singleline(&mut self.date_debut);
+                            if ui
+                                .button("📅")
+                                .on_hover_text("Choisir la date de début")
+                                .clicked()
                             {
-                                dialogue = dialogue.set_directory(dossier);
+                                if let Ok(date) =
+                                    NaiveDate::parse_from_str(&self.date_debut, "%Y-%m-%d")
+                                {
+                                    self.date_debut_mois =
+                                        NaiveDate::from_ymd_opt(date.year(), date.month(), 1)
+                                            .unwrap();
+                                }
+                                self.calendrier_debut_ouvert = true;
                             }
-                            if let Some(chemin) = dialogue.pick_file() {
-                                self.chemin_fichier_test = chemin.display().to_string();
+                            ui.label("Fin (AAAA-MM-JJ) :");
+                            ui.text_edit_singleline(&mut self.date_fin);
+                            if ui
+                                .button("📅")
+                                .on_hover_text("Choisir la date de fin")
+                                .clicked()
+                            {
+                                if let Ok(date) =
+                                    NaiveDate::parse_from_str(&self.date_fin, "%Y-%m-%d")
+                                {
+                                    self.date_fin_mois =
+                                        NaiveDate::from_ymd_opt(date.year(), date.month(), 1)
+                                            .unwrap();
+                                }
+                                self.calendrier_fin_ouvert = true;
+                            }
+                        });
+                    } else {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("Chemin fichier test :");
+                            ui.text_edit_singleline(&mut self.chemin_fichier_test);
+                            if ui.button("📂 Parcourir...").clicked() {
+                                let mut dialogue =
+                                    rfd::FileDialog::new().add_filter("Historique JSON", &["json"]);
+                                if let Some(dossier) =
+                                    std::path::Path::new(&self.chemin_fichier_test)
+                                        .parent()
+                                        .filter(|d| d.is_dir())
+                                {
+                                    dialogue = dialogue.set_directory(dossier);
+                                }
+                                if let Some(chemin) = dialogue.pick_file() {
+                                    self.chemin_fichier_test = chemin.display().to_string();
+                                }
+                            }
+                        });
+                    }
+
+                    ui.label("Paires à jouer :");
+                    let mut selection = self.symboles_test.clone();
+                    ui.horizontal_wrapped(|ui| {
+                        for symbole in &self.symboles_test_disponibles {
+                            let mut coche = selection.contains(&symbole.to_uppercase());
+                            if ui.checkbox(&mut coche, formater_paire(symbole)).changed() {
+                                if coche {
+                                    selection.insert(symbole.to_uppercase());
+                                } else {
+                                    selection.remove(&symbole.to_uppercase());
+                                }
                             }
                         }
-                    }
+                    });
+                    self.symboles_test = selection;
 
                     if ui.button("▶ Charger & Lancer l'Analyse").clicked() {
                         lancer_test = true;
@@ -426,26 +727,62 @@ impl eframe::App for ApplicationCryptobot {
 
             let mut s = self.parametrages.lire(&self.portee);
             let avant = s.clone();
-            ui.horizontal_wrapped(|ui| {
-                ui.add(egui::Slider::new(&mut s.score_min_alerte, 0..=100).text("Seuil d'alerte"));
-                ui.separator();
-                editeur_indicateurs(ui, &mut s);
-                ui.separator();
-                if ui.button("✔ Appliquer").clicked() {
-                    lancer_test = true;
-                }
-            });
+            let bloc_vertical = matches!(self.portee, Portee::Groupe(_));
+            if bloc_vertical {
+                ui.vertical(|ui| {
+                    ui.add(
+                        egui::Slider::new(&mut s.score_min_alerte, 0..=100).text("Seuil d'alerte"),
+                    );
+                    editeur_indicateurs(ui, &mut s, true);
+                    if ui.button("✔ Appliquer").clicked() {
+                        lancer_test = true;
+                    }
+                });
+            } else {
+                ui.horizontal_wrapped(|ui| {
+                    ui.add(
+                        egui::Slider::new(&mut s.score_min_alerte, 0..=100).text("Seuil d'alerte"),
+                    );
+                    ui.separator();
+                    editeur_indicateurs(ui, &mut s, false);
+                    ui.separator();
+                    if ui.button("✔ Appliquer").clicked() {
+                        lancer_test = true;
+                    }
+                });
+            }
             if s != avant {
                 self.parametrages.ecrire(&self.portee, s);
             }
         });
 
+        afficher_calendrier(
+            ctx,
+            "Choisir la date de début",
+            "calendrier_debut",
+            &mut self.calendrier_debut_ouvert,
+            &mut self.date_debut_mois,
+            &mut self.date_debut,
+        );
+        afficher_calendrier(
+            ctx,
+            "Choisir la date de fin",
+            "calendrier_fin",
+            &mut self.calendrier_fin_ouvert,
+            &mut self.date_fin_mois,
+            &mut self.date_fin,
+        );
+
         if self.mode_actif != mode_avant {
             self.changer_de_mode();
         } else if lancer_test {
-            self.reinitialiser();
-            self.statut = "Chargement en cours...".to_string();
-            self.lancer();
+            if self.symboles_test.is_empty() {
+                self.statut = "Sélectionnez au moins une paire à jouer.".to_string();
+            } else {
+                self.reinitialiser();
+                self.statut = "Chargement en cours...".to_string();
+                self.lancer();
+            }
         }
 
         // 3. PANNEAU INFÉRIEUR : Journal des alertes
@@ -537,7 +874,7 @@ impl eframe::App for ApplicationCryptobot {
                             ui.vertical(|ui| {
                                 // Titre & Prix actuel
                                 ui.horizontal(|ui| {
-                                    ui.heading(symbole);
+                                    ui.heading(formater_paire(symbole));
                                     ui.label(
                                         egui::RichText::new(format!("({})", signal.unite))
                                             .color(egui::Color32::GRAY),
@@ -693,7 +1030,7 @@ impl eframe::App for ApplicationCryptobot {
                                 egui::CollapsingHeader::new("⚙ Paramètres de la paire")
                                     .id_source(("params", symbole))
                                     .show(ui, |ui| {
-                                        ui.horizontal_wrapped(|ui| {
+                                        ui.vertical(|ui| {
                                             ui.add(
                                                 egui::Slider::new(
                                                     &mut strat.score_min_alerte,
@@ -701,7 +1038,7 @@ impl eframe::App for ApplicationCryptobot {
                                                 )
                                                 .text("Seuil"),
                                             );
-                                            editeur_indicateurs(ui, &mut strat);
+                                            editeur_indicateurs(ui, &mut strat, true);
                                         });
                                         if ui.button("✔ Appliquer").clicked() {
                                             appliquer = true;
