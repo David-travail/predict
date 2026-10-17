@@ -23,6 +23,7 @@ multiplier = 1.2
 
 [network]
 rate_limit_ms = 200
+<<<<<<< Updated upstream
 proxy = "http://127.0.0.1:9000"
 
 # Bloc de paires : paramétrage commun (optionnel) ; priorité : paire > bloc > [strategy].
@@ -43,3 +44,6 @@ proxy = "http://127.0.0.1:9000"
 # Paramétrage propre à une paire : [overrides.SOLEUR] avec les mêmes sous-tables que [strategy].
 
 # Les réglages modifiés dans l'IHM sont sauvegardés dans parametres.toml (prioritaire sur ce fichier).
+=======
+# proxy = "http://127.0.0.1:9000"
+>>>>>>> Stashed changes
