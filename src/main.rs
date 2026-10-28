@@ -369,6 +369,7 @@ fn executer(_avec_arguments: bool) -> Result<(), Box<dyn std::error::Error>> {
         "Crypto Trend Detector H24",
         options,
         Box::new(move |_cc| {
+<<<<<<< Updated upstream
             Box::new(
                 ui::ApplicationCryptobot::new(
                     connexion.rx_signaux,
@@ -379,6 +380,12 @@ fn executer(_avec_arguments: bool) -> Result<(), Box<dyn std::error::Error>> {
                 .avec_moteur(connexion.tx_commandes, connexion.rx_statut)
                 .avec_etat_initial(generation, mode, signaux, statut),
             )
+=======
+            Ok(Box::new(
+                ui::ApplicationCryptobot::new(rx_ui, strategie_ui, unite_ui)
+                    .avec_moteur(tx_commandes, rx_statut),
+            ))
+>>>>>>> Stashed changes
         }),
     )?;
 

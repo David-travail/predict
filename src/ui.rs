@@ -527,7 +527,9 @@ fn editeur_indicateurs(
 }
 
 impl eframe::App for ApplicationCryptobot {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+
         // 1. Réception des signaux du moteur Tokio
         while let Ok(signal) = self.rx_mpsc.try_recv() {
             if signal.generation != self.generation {
@@ -588,7 +590,7 @@ impl eframe::App for ApplicationCryptobot {
         let mut fournisseurs_modifies = false;
 
         // 2. BARRE SUPÉRIEURE : Sélection du mode & Seuil
-        egui::TopBottomPanel::top("en_tete").show(ctx, |ui| {
+        egui::Panel::top("en_tete").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("⚡ Détecteur de Tendances Crypto H24");
                 ui.separator();
@@ -768,6 +770,7 @@ impl eframe::App for ApplicationCryptobot {
             let mut heriter = false;
             let mut propager = false;
             ui.horizontal_wrapped(|ui| {
+<<<<<<< Updated upstream
                 ui.label("Paramétrage :");
                 let libelle = |p: &Portee| match p {
                     Portee::Generique => "Générique".to_string(),
@@ -776,6 +779,13 @@ impl eframe::App for ApplicationCryptobot {
                 };
                 egui::ComboBox::from_id_source("portee")
                     .selected_text(libelle(&self.portee))
+=======
+                let s = &mut self.strategie;
+                ui.label("Période");
+                egui::ComboBox::from_id_salt("unite_temps")
+                    .selected_text(self.unite.as_str())
+                    .width(60.0)
+>>>>>>> Stashed changes
                     .show_ui(ui, |ui| {
                         ui.selectable_value(&mut self.portee, Portee::Generique, "Générique");
                         for nom in self.parametrages.groupes.keys() {
@@ -789,6 +799,7 @@ impl eframe::App for ApplicationCryptobot {
                             ui.selectable_value(&mut self.portee, p, texte);
                         }
                     });
+<<<<<<< Updated upstream
                 if self.portee != Portee::Generique {
                     let propre = self.parametrages.a_un_reglage_propre(&self.portee);
                     ui.label(if propre {
@@ -814,6 +825,45 @@ impl eframe::App for ApplicationCryptobot {
                 }
                 if ui.button("💾 Sauvegarder").clicked() {
                     sauvegarder = true;
+=======
+                ui.separator();
+                ui.label("EMA période");
+                ui.add(egui::DragValue::new(&mut s.filtre_macro.periode_ema).range(2..=1000));
+                ui.checkbox(&mut s.filtre_macro.utiliser_supertrend, "Supertrend");
+                ui.add_enabled_ui(s.filtre_macro.utiliser_supertrend, |ui| {
+                    ui.label("ATR période");
+                    ui.add(
+                        egui::DragValue::new(&mut s.filtre_macro.periode_supertrend).range(1..=100),
+                    );
+                    ui.label("×");
+                    ui.add(
+                        egui::DragValue::new(&mut s.filtre_macro.multiplicateur_supertrend)
+                            .range(0.1..=10.0)
+                            .speed(0.05),
+                    );
+                });
+                ui.separator();
+                ui.label("ADX période");
+                ui.add(egui::DragValue::new(&mut s.adx.periode).range(2..=100));
+                ui.label("seuil");
+                ui.add(
+                    egui::DragValue::new(&mut s.adx.seuil_minimal)
+                        .range(1.0..=100.0)
+                        .speed(0.5),
+                );
+                ui.separator();
+                ui.label("Volume SMA");
+                ui.add(egui::DragValue::new(&mut s.volume.periode_moyenne_mobile).range(2..=500));
+                ui.label("×");
+                ui.add(
+                    egui::DragValue::new(&mut s.volume.multiplicateur)
+                        .range(0.1..=10.0)
+                        .speed(0.05),
+                );
+                ui.separator();
+                if ui.button("✔ Appliquer").clicked() {
+                    lancer_test = true;
+>>>>>>> Stashed changes
                 }
             });
             if heriter {
@@ -895,10 +945,10 @@ impl eframe::App for ApplicationCryptobot {
 
         // 3. PANNEAU INFÉRIEUR : Journal des alertes
         let mut alerte_cliquee: Option<SignalVisuel> = None;
-        egui::TopBottomPanel::bottom("journal_alertes")
+        egui::Panel::bottom("journal_alertes")
             .resizable(true)
-            .default_height(140.0)
-            .show(ctx, |ui| {
+            .default_size(140.0)
+            .show(ui, |ui| {
                 ui.heading("🚨 Dernières Alertes Détectées");
                 ui.separator();
 
@@ -957,7 +1007,7 @@ impl eframe::App for ApplicationCryptobot {
         }
 
         // 4. PANNEAU CENTRAL : Grille des cartes par paire
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             ui.heading("📊 Paires Surveillées en Temps Réel");
             if !self.statut.is_empty() {
                 ui.label(

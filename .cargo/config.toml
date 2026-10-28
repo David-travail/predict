@@ -1,4 +1,7 @@
-[target.x86_64-pc-windows-msvc]
-linker = "C:\\Program Files\\Microsoft Visual Studio\\18\\Community\\VC\\Tools\\MSVC\\14.50.35717\\bin\\Hostx64\\x64\\link.exe"
-[http]
-proxy = "http://proxy.reseau.ratp:80"
+[build]
+jobs = 8
+
+[alias]
+b = "build"
+br = "build --release"
+r = "run"
