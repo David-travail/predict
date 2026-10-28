@@ -379,7 +379,7 @@ fn editeur_indicateurs(
 ) {
     if disposition_verticale {
         ui.label("Période");
-        egui::ComboBox::from_id_source(ui.id().with("unite_temps"))
+        egui::ComboBox::from_id_salt(ui.id().with("unite_temps"))
             .selected_text(s.unite_temps.as_str())
             .width(60.0)
             .show_ui(ui, |ui| {
@@ -388,34 +388,32 @@ fn editeur_indicateurs(
                 }
             });
         ui.label("EMA période");
-        ui.add(egui::DragValue::new(&mut s.filtre_macro.periode_ema).clamp_range(2..=1000));
+        ui.add(egui::DragValue::new(&mut s.filtre_macro.periode_ema).range(2..=1000));
         ui.checkbox(&mut s.filtre_macro.utiliser_supertrend, "Supertrend");
         if s.filtre_macro.utiliser_supertrend {
             ui.label("ATR période");
-            ui.add(
-                egui::DragValue::new(&mut s.filtre_macro.periode_supertrend).clamp_range(1..=100),
-            );
+            ui.add(egui::DragValue::new(&mut s.filtre_macro.periode_supertrend).range(1..=100));
             ui.label("Supertrend multiplicateur");
             ui.add(
                 egui::DragValue::new(&mut s.filtre_macro.multiplicateur_supertrend)
-                    .clamp_range(0.1..=10.0)
+                    .range(0.1..=10.0)
                     .speed(0.05),
             );
         }
         ui.label("ADX période");
-        ui.add(egui::DragValue::new(&mut s.adx.periode).clamp_range(2..=100));
+        ui.add(egui::DragValue::new(&mut s.adx.periode).range(2..=100));
         ui.label("ADX seuil");
         ui.add(
             egui::DragValue::new(&mut s.adx.seuil_minimal)
-                .clamp_range(1.0..=100.0)
+                .range(1.0..=100.0)
                 .speed(0.5),
         );
         ui.label("Volume SMA (bougies)");
-        ui.add(egui::DragValue::new(&mut s.volume.periode_moyenne_mobile).clamp_range(2..=500));
+        ui.add(egui::DragValue::new(&mut s.volume.periode_moyenne_mobile).range(2..=500));
         ui.label("Multiplicateur volume");
         ui.add(
             egui::DragValue::new(&mut s.volume.multiplicateur)
-                .clamp_range(0.1..=10.0)
+                .range(0.1..=10.0)
                 .speed(0.05)
                 .suffix("×"),
         );
@@ -425,7 +423,7 @@ fn editeur_indicateurs(
     if ui.available_width() < 500.0 {
         ui.horizontal(|ui| {
             ui.label("Période");
-            egui::ComboBox::from_id_source(ui.id().with("unite_temps"))
+            egui::ComboBox::from_id_salt(ui.id().with("unite_temps"))
                 .selected_text(s.unite_temps.as_str())
                 .width(60.0)
                 .show_ui(ui, |ui| {
@@ -436,45 +434,42 @@ fn editeur_indicateurs(
         });
         ui.horizontal(|ui| {
             ui.label("EMA période");
-            ui.add(egui::DragValue::new(&mut s.filtre_macro.periode_ema).clamp_range(2..=1000));
+            ui.add(egui::DragValue::new(&mut s.filtre_macro.periode_ema).range(2..=1000));
         });
         ui.checkbox(&mut s.filtre_macro.utiliser_supertrend, "Supertrend");
         if s.filtre_macro.utiliser_supertrend {
             ui.horizontal(|ui| {
                 ui.label("ATR période");
-                ui.add(
-                    egui::DragValue::new(&mut s.filtre_macro.periode_supertrend)
-                        .clamp_range(1..=100),
-                );
+                ui.add(egui::DragValue::new(&mut s.filtre_macro.periode_supertrend).range(1..=100));
                 ui.label("×");
                 ui.add(
                     egui::DragValue::new(&mut s.filtre_macro.multiplicateur_supertrend)
-                        .clamp_range(0.1..=10.0)
+                        .range(0.1..=10.0)
                         .speed(0.05),
                 );
             });
         }
         ui.horizontal(|ui| {
             ui.label("ADX période");
-            ui.add(egui::DragValue::new(&mut s.adx.periode).clamp_range(2..=100));
+            ui.add(egui::DragValue::new(&mut s.adx.periode).range(2..=100));
         });
         ui.horizontal(|ui| {
             ui.label("ADX seuil");
             ui.add(
                 egui::DragValue::new(&mut s.adx.seuil_minimal)
-                    .clamp_range(1.0..=100.0)
+                    .range(1.0..=100.0)
                     .speed(0.5),
             );
         });
         ui.horizontal(|ui| {
             ui.label("Volume SMA (bougies)");
-            ui.add(egui::DragValue::new(&mut s.volume.periode_moyenne_mobile).clamp_range(2..=500));
+            ui.add(egui::DragValue::new(&mut s.volume.periode_moyenne_mobile).range(2..=500));
         });
         ui.horizontal(|ui| {
             ui.label("Multiplicateur volume");
             ui.add(
                 egui::DragValue::new(&mut s.volume.multiplicateur)
-                    .clamp_range(0.1..=10.0)
+                    .range(0.1..=10.0)
                     .speed(0.05)
                     .suffix("×"),
             );
@@ -483,7 +478,7 @@ fn editeur_indicateurs(
     }
 
     ui.label("Période");
-    egui::ComboBox::from_id_source(ui.id().with("unite_temps"))
+    egui::ComboBox::from_id_salt(ui.id().with("unite_temps"))
         .selected_text(s.unite_temps.as_str())
         .width(60.0)
         .show_ui(ui, |ui| {
@@ -493,34 +488,34 @@ fn editeur_indicateurs(
         });
     ui.separator();
     ui.label("EMA période");
-    ui.add(egui::DragValue::new(&mut s.filtre_macro.periode_ema).clamp_range(2..=1000));
+    ui.add(egui::DragValue::new(&mut s.filtre_macro.periode_ema).range(2..=1000));
     ui.checkbox(&mut s.filtre_macro.utiliser_supertrend, "Supertrend");
     ui.add_enabled_ui(s.filtre_macro.utiliser_supertrend, |ui| {
         ui.label("ATR période");
-        ui.add(egui::DragValue::new(&mut s.filtre_macro.periode_supertrend).clamp_range(1..=100));
+        ui.add(egui::DragValue::new(&mut s.filtre_macro.periode_supertrend).range(1..=100));
         ui.label("×");
         ui.add(
             egui::DragValue::new(&mut s.filtre_macro.multiplicateur_supertrend)
-                .clamp_range(0.1..=10.0)
+                .range(0.1..=10.0)
                 .speed(0.05),
         );
     });
     ui.separator();
     ui.label("ADX période");
-    ui.add(egui::DragValue::new(&mut s.adx.periode).clamp_range(2..=100));
+    ui.add(egui::DragValue::new(&mut s.adx.periode).range(2..=100));
     ui.label("seuil");
     ui.add(
         egui::DragValue::new(&mut s.adx.seuil_minimal)
-            .clamp_range(1.0..=100.0)
+            .range(1.0..=100.0)
             .speed(0.5),
     );
     ui.separator();
     ui.label("Volume SMA");
-    ui.add(egui::DragValue::new(&mut s.volume.periode_moyenne_mobile).clamp_range(2..=500));
+    ui.add(egui::DragValue::new(&mut s.volume.periode_moyenne_mobile).range(2..=500));
     ui.label("Multiplicateur");
     ui.add(
         egui::DragValue::new(&mut s.volume.multiplicateur)
-            .clamp_range(0.1..=10.0)
+            .range(0.1..=10.0)
             .speed(0.05)
             .suffix("×"),
     );
@@ -572,7 +567,7 @@ impl eframe::App for ApplicationCryptobot {
                 .collapsible(false)
                 .resizable(true)
                 .default_width(520.0)
-                .show(ctx, |ui| {
+                .show(&ctx, |ui| {
                     ui.label(erreur);
                     if ui.button("Fermer").clicked() {
                         fermer = true;
@@ -770,22 +765,14 @@ impl eframe::App for ApplicationCryptobot {
             let mut heriter = false;
             let mut propager = false;
             ui.horizontal_wrapped(|ui| {
-<<<<<<< Updated upstream
                 ui.label("Paramétrage :");
                 let libelle = |p: &Portee| match p {
                     Portee::Generique => "Générique".to_string(),
                     Portee::Groupe(nom) => format!("Bloc {nom}"),
                     Portee::Paire(symbole) => format!("Paire {symbole}"),
                 };
-                egui::ComboBox::from_id_source("portee")
+                egui::ComboBox::from_id_salt("portee")
                     .selected_text(libelle(&self.portee))
-=======
-                let s = &mut self.strategie;
-                ui.label("Période");
-                egui::ComboBox::from_id_salt("unite_temps")
-                    .selected_text(self.unite.as_str())
-                    .width(60.0)
->>>>>>> Stashed changes
                     .show_ui(ui, |ui| {
                         ui.selectable_value(&mut self.portee, Portee::Generique, "Générique");
                         for nom in self.parametrages.groupes.keys() {
@@ -799,7 +786,6 @@ impl eframe::App for ApplicationCryptobot {
                             ui.selectable_value(&mut self.portee, p, texte);
                         }
                     });
-<<<<<<< Updated upstream
                 if self.portee != Portee::Generique {
                     let propre = self.parametrages.a_un_reglage_propre(&self.portee);
                     ui.label(if propre {
@@ -825,45 +811,6 @@ impl eframe::App for ApplicationCryptobot {
                 }
                 if ui.button("💾 Sauvegarder").clicked() {
                     sauvegarder = true;
-=======
-                ui.separator();
-                ui.label("EMA période");
-                ui.add(egui::DragValue::new(&mut s.filtre_macro.periode_ema).range(2..=1000));
-                ui.checkbox(&mut s.filtre_macro.utiliser_supertrend, "Supertrend");
-                ui.add_enabled_ui(s.filtre_macro.utiliser_supertrend, |ui| {
-                    ui.label("ATR période");
-                    ui.add(
-                        egui::DragValue::new(&mut s.filtre_macro.periode_supertrend).range(1..=100),
-                    );
-                    ui.label("×");
-                    ui.add(
-                        egui::DragValue::new(&mut s.filtre_macro.multiplicateur_supertrend)
-                            .range(0.1..=10.0)
-                            .speed(0.05),
-                    );
-                });
-                ui.separator();
-                ui.label("ADX période");
-                ui.add(egui::DragValue::new(&mut s.adx.periode).range(2..=100));
-                ui.label("seuil");
-                ui.add(
-                    egui::DragValue::new(&mut s.adx.seuil_minimal)
-                        .range(1.0..=100.0)
-                        .speed(0.5),
-                );
-                ui.separator();
-                ui.label("Volume SMA");
-                ui.add(egui::DragValue::new(&mut s.volume.periode_moyenne_mobile).range(2..=500));
-                ui.label("×");
-                ui.add(
-                    egui::DragValue::new(&mut s.volume.multiplicateur)
-                        .range(0.1..=10.0)
-                        .speed(0.05),
-                );
-                ui.separator();
-                if ui.button("✔ Appliquer").clicked() {
-                    lancer_test = true;
->>>>>>> Stashed changes
                 }
             });
             if heriter {
@@ -911,7 +858,7 @@ impl eframe::App for ApplicationCryptobot {
         });
 
         afficher_calendrier(
-            ctx,
+            &ctx,
             "Choisir la date de début",
             "calendrier_debut",
             &mut self.calendrier_debut_ouvert,
@@ -919,7 +866,7 @@ impl eframe::App for ApplicationCryptobot {
             &mut self.date_debut,
         );
         afficher_calendrier(
-            ctx,
+            &ctx,
             "Choisir la date de fin",
             "calendrier_fin",
             &mut self.calendrier_fin_ouvert,
@@ -1186,7 +1133,7 @@ impl eframe::App for ApplicationCryptobot {
                                 );
 
                                 egui::CollapsingHeader::new("⚙ Paramètres de la paire")
-                                    .id_source(("params", symbole))
+                                    .id_salt(("params", symbole))
                                     .show(ui, |ui| {
                                         ui.vertical(|ui| {
                                             ui.add(
