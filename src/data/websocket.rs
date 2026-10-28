@@ -6,14 +6,9 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use std::error::Error;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::sync::mpsc::Sender;
 use tokio::time::{sleep, timeout};
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, client_async_tls_with_config, connect_async,
-};
 use tracing::{error, info, warn};
 
 const URL_BASE: &str = "wss://stream.binance.com:443/stream?streams=";
@@ -71,49 +66,6 @@ fn construire_url(symboles: &[String], ut_execution: &str) -> String {
     format!("{URL_BASE}{}", flux.join("/"))
 }
 
-/// Ouvre la connexion WebSocket, directement ou via un tunnel HTTP CONNECT si un proxy est défini.
-async fn ouvrir_connexion(
-    url: &str,
-) -> Result<
-    (
-        WebSocketStream<MaybeTlsStream<TcpStream>>,
-        tokio_tungstenite::tungstenite::handshake::client::Response,
-    ),
-    Box<dyn Error>,
-> {
-    let Some(proxy) = super::reseau::proxy() else {
-        return Ok(connect_async(url).await?);
-    };
-
-    let adresse = super::reseau::adresse_proxy(&proxy);
-    let mut tcp = timeout(Duration::from_secs(15), TcpStream::connect(&adresse))
-        .await
-        .map_err(|_| format!("délai dépassé en se connectant au proxy {adresse}"))??;
-
-    let requete = format!("CONNECT {HOTE_FLUX} HTTP/1.1\r\nHost: {HOTE_FLUX}\r\n\r\n");
-    tcp.write_all(requete.as_bytes()).await?;
-
-    let mut reponse = Vec::new();
-    let mut octet = [0u8; 1];
-    while !reponse.ends_with(b"\r\n\r\n") {
-        if reponse.len() > 8192 || tcp.read(&mut octet).await? == 0 {
-            return Err("réponse invalide du proxy au CONNECT".into());
-        }
-        reponse.push(octet[0]);
-    }
-    let entete = String::from_utf8_lossy(&reponse);
-    let statut = entete.lines().next().unwrap_or_default();
-    if !statut
-        .split_whitespace()
-        .nth(1)
-        .is_some_and(|code| code == "200")
-    {
-        return Err(format!("le proxy a refusé le tunnel : {statut}").into());
-    }
-
-    Ok(client_async_tls_with_config(url, tcp, None, None).await?)
-}
-
 /// Maintient une connexion jusqu'à erreur. `Ok(())` signifie que `tx` est fermé.
 /// Remet `delai` à sa valeur initiale dès que la connexion est établie.
 async fn connecter_et_lire(
@@ -121,11 +73,11 @@ async fn connecter_et_lire(
     tx: &Sender<Bougie>,
     delai: &mut Duration,
 ) -> Result<(), Box<dyn Error>> {
-    let (flux, _) = match ouvrir_connexion(url).await {
+    let (flux, _) = match super::reseau::ouvrir_websocket(url, HOTE_FLUX).await {
         Ok(connexion) => connexion,
         Err(e) => {
             error!(url = %url, "Échec de connexion WebSocket : {}", e.to_string());
-            return Err(e.into());
+            return Err(e);
         }
     };
     info!("Flux WebSocket connecté");

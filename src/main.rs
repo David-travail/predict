@@ -6,6 +6,7 @@ mod config;
 mod core;
 mod data;
 mod indicators;
+mod ipc;
 mod ui;
 
 use crate::config::{ConfigurationApplication, ConfigurationStrategie, Parametrages};
@@ -13,23 +14,27 @@ use crate::core::modeles::{AnalyseTechnique, Bougie, Tendance};
 use crate::core::scoring::calculer_score;
 use crate::data::rest::{telecharger_bougies_periode, telecharger_plage_bougies};
 use crate::data::simulation::{generer_historique_fictif, simuler_flux_temps_reel};
+use crate::data::sources::{Agregateur, BougieSourcee, Fournisseur, agreger_historique};
 use crate::data::websocket::ecouter_flux_temps_reel;
 use crate::indicators::adx::calculer_adx;
 use crate::indicators::ema::calculer_ema;
 use crate::indicators::supertrend::supertrend_haussier;
 use crate::indicators::volume::{calculer_sma, valider_cassure_volume};
-use crate::ui::{CommandeMoteur, ModeExecution, SignalVisuel};
+use crate::ui::{CommandeMoteur, ModeExecution, NotificationMoteur, SignalVisuel};
 
 use chrono::{Local, NaiveDate};
 use clap::{Parser, ValueEnum};
 use std::collections::{HashMap, HashSet};
+use std::fs::OpenOptions;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tracing::{Level, error, info};
+use tracing::{Level, error, info, warn};
 use tracing_subscriber::FmtSubscriber;
+use tracing_subscriber::fmt::writer::MakeWriterExt;
 
 /// Nombre de bougies antérieures au début d'un test, nécessaires pour amorcer EMA 200 et ADX.
 const BOUGIES_PRECHAUFFAGE: usize = 200;
@@ -44,13 +49,25 @@ enum ModeCli {
     Fichier,
 }
 
-/// Détecteur de tendances crypto : interface graphique par défaut, ou console avec `--console`.
+/// Détecteur de tendances crypto : serveur en console ou interface connectée à un serveur.
 #[derive(Parser)]
 #[command(version, about)]
 struct Arguments {
-    /// Lance en mode console, sans interface graphique
+    /// Lance une analyse en console sans serveur (mode historique).
     #[arg(long)]
     console: bool,
+    /// Lance le moteur et l'IHM ensemble ; fermer l'IHM arrête aussi le moteur.
+    #[arg(long, conflicts_with_all = ["console", "serve", "connect"])]
+    local: bool,
+    /// Lance le moteur comme serveur réseau contrôlable par l'IHM.
+    #[arg(long, conflicts_with_all = ["console", "connect"])]
+    serve: bool,
+    /// Adresse d'écoute du serveur (défaut : 0.0.0.0:8765).
+    #[arg(long, requires = "serve")]
+    listen: Option<SocketAddr>,
+    /// Adresse du moteur auquel connecter l'IHM (défaut : 127.0.0.1:8765).
+    #[arg(long, conflicts_with = "console")]
+    connect: Option<SocketAddr>,
     /// Mode d'exécution en console
     #[arg(long, value_enum, default_value = "temps-reel", requires = "console")]
     mode: ModeCli,
@@ -194,8 +211,13 @@ fn executer(_avec_arguments: bool) -> Result<(), Box<dyn std::error::Error>> {
     let arguments = Arguments::parse();
 
     // 1. Initialisation des journaux (logs)
+    let fichier_log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("predict.log")?;
     let subscriber = FmtSubscriber::builder()
         .with_max_level(Level::INFO)
+        .with_writer(std::io::stdout.and(fichier_log))
         .finish();
     tracing::subscriber::set_global_default(subscriber)?;
 
@@ -208,44 +230,136 @@ fn executer(_avec_arguments: bool) -> Result<(), Box<dyn std::error::Error>> {
 
     let chemin_parametrages = chemin_parametrages(arguments.config.as_ref());
     let parametrages = charger_parametrages(&config, &chemin_parametrages);
-    let parametrages_ui = parametrages.clone();
-    let symboles_ui = config.paires.symboles.clone();
-
-    // Le moteur tourne sur la runtime Tokio ; egui occupe le thread principal.
     let runtime = tokio::runtime::Runtime::new()?;
-    let (tx_ui, rx_ui) = mpsc::channel::<SignalVisuel>(256);
-    let (tx_commandes, rx_commandes) = mpsc::unbounded_channel::<CommandeMoteur>();
-    let (tx_statut, rx_statut) = mpsc::unbounded_channel::<(u64, String)>();
 
-    let (mode, date_debut, date_fin, chemin_fichier) = if arguments.console {
-        parametres_console(&arguments)?
-    } else {
-        (
-            ModeExecution::TempsReel,
-            String::new(),
-            String::new(),
-            String::new(),
-        )
-    };
-
-    // Génération 0 : première session, démarrée avant l'ouverture de l'IHM.
-    tx_commandes.send(CommandeMoteur::Demarrer {
-        generation: 0,
-        mode,
-        date_debut,
-        date_fin,
-        chemin_fichier,
-        symboles_test: config.paires.symboles.clone(),
-        parametrages,
-    })?;
-    runtime.spawn(moteur(Arc::new(config), tx_ui, tx_statut, rx_commandes));
+    if arguments.local {
+        let (tx_ui, rx_ui) = mpsc::channel::<SignalVisuel>(256);
+        let (tx_commandes, rx_commandes) = mpsc::unbounded_channel::<CommandeMoteur>();
+        let (tx_statut, rx_statut) = mpsc::unbounded_channel::<(u64, NotificationMoteur)>();
+        tx_commandes.send(CommandeMoteur::Demarrer {
+            generation: 0,
+            mode: ModeExecution::TempsReel,
+            date_debut: String::new(),
+            date_fin: String::new(),
+            chemin_fichier: String::new(),
+            symboles_test: config.paires.symboles.clone(),
+            parametrages: parametrages.clone(),
+            fournisseurs: config.sources_donnees.fournisseurs.clone(),
+        })?;
+        runtime.spawn(moteur(
+            Arc::new(config.clone()),
+            tx_ui,
+            tx_statut,
+            rx_commandes,
+        ));
+        let options = eframe::NativeOptions {
+            viewport: egui::ViewportBuilder::default().with_inner_size([900.0, 600.0]),
+            ..Default::default()
+        };
+        let resultat = eframe::run_native(
+            "Crypto Trend Detector H24",
+            options,
+            Box::new(move |_cc| {
+                Box::new(
+                    ui::ApplicationCryptobot::new(
+                        rx_ui,
+                        parametrages,
+                        config.sources_donnees.fournisseurs.clone(),
+                        config.paires.symboles.clone(),
+                    )
+                    .avec_moteur(tx_commandes, rx_statut),
+                )
+            }),
+        );
+        runtime.shutdown_background();
+        resultat?;
+        return Ok(());
+    }
 
     if arguments.console {
+        let (tx_ui, rx_ui) = mpsc::channel::<SignalVisuel>(256);
+        let (tx_commandes, rx_commandes) = mpsc::unbounded_channel::<CommandeMoteur>();
+        let (tx_statut, rx_statut) = mpsc::unbounded_channel::<(u64, NotificationMoteur)>();
+        let (mode, date_debut, date_fin, chemin_fichier) = parametres_console(&arguments)?;
+        tx_commandes.send(CommandeMoteur::Demarrer {
+            generation: 0,
+            mode,
+            date_debut,
+            date_fin,
+            chemin_fichier,
+            symboles_test: config.paires.symboles.clone(),
+            parametrages,
+            fournisseurs: config.sources_donnees.fournisseurs.clone(),
+        })?;
+        runtime.spawn(moteur(Arc::new(config), tx_ui, tx_statut, rx_commandes));
         let resultat = runtime.block_on(boucle_console(mode, rx_ui, rx_statut));
         drop(tx_commandes);
         runtime.shutdown_background();
-        return resultat.map_err(Into::into);
+        return resultat.map_err(|erreur| std::io::Error::other(erreur.to_string()).into());
     }
+
+    if arguments.serve {
+        let jeton = charger_jeton()?;
+        let adresse = arguments
+            .listen
+            .unwrap_or_else(|| "0.0.0.0:8765".parse().expect("Adresse par défaut valide"));
+        let listener = std::net::TcpListener::bind(adresse)?;
+        listener.set_nonblocking(true)?;
+        let (tx_ui, rx_ui) = mpsc::channel::<SignalVisuel>(256);
+        let (tx_commandes, rx_commandes) = mpsc::unbounded_channel::<CommandeMoteur>();
+        let (tx_statut, rx_statut) = mpsc::unbounded_channel::<(u64, NotificationMoteur)>();
+        tx_commandes.send(CommandeMoteur::Demarrer {
+            generation: 0,
+            mode: ModeExecution::TempsReel,
+            date_debut: String::new(),
+            date_fin: String::new(),
+            chemin_fichier: String::new(),
+            symboles_test: config.paires.symboles.clone(),
+            parametrages: parametrages.clone(),
+            fournisseurs: config.sources_donnees.fournisseurs.clone(),
+        })?;
+        let etat_initial = ipc::EtatServeur {
+            symboles: config.paires.symboles.clone(),
+            parametrages,
+            fournisseurs: config.sources_donnees.fournisseurs.clone(),
+            generation: 0,
+            mode: ModeExecution::TempsReel,
+            statut: None,
+            signaux: Vec::new(),
+        };
+        let resultat = runtime.block_on(async {
+            let listener = tokio::net::TcpListener::from_std(listener)?;
+            runtime.spawn(moteur(Arc::new(config), tx_ui, tx_statut, rx_commandes));
+            ipc::servir(
+                listener,
+                jeton,
+                etat_initial,
+                tx_commandes,
+                chemin_parametrages,
+                rx_ui,
+                rx_statut,
+            )
+            .await
+        });
+        runtime.shutdown_background();
+        return resultat.map_err(|erreur| std::io::Error::other(erreur.to_string()).into());
+    }
+
+    let jeton = charger_jeton()?;
+    let adresse = arguments
+        .connect
+        .unwrap_or_else(|| "127.0.0.1:8765".parse().expect("Adresse par défaut valide"));
+    let connexion = runtime
+        .block_on(ipc::connecter(&adresse.to_string(), jeton))
+        .map_err(|erreur| std::io::Error::other(erreur.to_string()))?;
+    let etat = connexion.etat;
+    let parametrages_ui = etat.parametrages.clone();
+    let symboles_ui = etat.symboles.clone();
+    let fournisseurs_ui = etat.fournisseurs.clone();
+    let generation = etat.generation;
+    let mode = etat.mode;
+    let signaux = etat.signaux;
+    let statut = etat.statut;
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([900.0, 600.0]),
@@ -257,18 +371,29 @@ fn executer(_avec_arguments: bool) -> Result<(), Box<dyn std::error::Error>> {
         Box::new(move |_cc| {
             Box::new(
                 ui::ApplicationCryptobot::new(
-                    rx_ui,
+                    connexion.rx_signaux,
                     parametrages_ui,
+                    fournisseurs_ui,
                     symboles_ui,
-                    chemin_parametrages,
                 )
-                .avec_moteur(tx_commandes, rx_statut),
+                .avec_moteur(connexion.tx_commandes, connexion.rx_statut)
+                .avec_etat_initial(generation, mode, signaux, statut),
             )
         }),
     )?;
 
     runtime.shutdown_background();
     Ok(())
+}
+
+fn charger_jeton() -> Result<String, Box<dyn std::error::Error>> {
+    let jeton = std::env::var("PREDICT_TOKEN").map_err(
+        |_| "Définissez la variable d'environnement PREDICT_TOKEN sur le moteur et l'IHM",
+    )?;
+    if jeton.len() < 16 {
+        return Err("PREDICT_TOKEN doit contenir au moins 16 caractères".into());
+    }
+    Ok(jeton)
 }
 
 fn parametres_console(
@@ -307,7 +432,7 @@ fn parametres_console(
 async fn boucle_console(
     mode: ModeExecution,
     mut rx_signaux: mpsc::Receiver<SignalVisuel>,
-    mut rx_statut: mpsc::UnboundedReceiver<(u64, String)>,
+    mut rx_statut: mpsc::UnboundedReceiver<(u64, NotificationMoteur)>,
 ) -> Result<(), String> {
     let rejeu = matches!(
         mode,
@@ -324,14 +449,20 @@ async fn boucle_console(
                     );
                 }
             }
-            statut = rx_statut.recv() => {
-                let Some((_, texte)) = statut else { return Ok(()) };
-                println!("{texte}");
-                if texte.starts_with('❌') {
-                    return Err(texte);
-                }
-                if texte.starts_with('✅') {
-                    return Ok(());
+            notification = rx_statut.recv() => {
+                let Some((_, notification)) = notification else { return Ok(()) };
+                match notification {
+                    NotificationMoteur::Statut(texte) => {
+                        println!("{texte}");
+                        if texte.starts_with('✅') {
+                            return Ok(());
+                        }
+                    }
+                    NotificationMoteur::Erreur(texte) => eprintln!("Erreur de source : {texte}"),
+                    NotificationMoteur::Echec(texte) => {
+                        eprintln!("Erreur : {texte}");
+                        return Err(texte);
+                    }
                 }
             }
             _ = tokio::signal::ctrl_c() => return Ok(()),
@@ -343,9 +474,10 @@ async fn boucle_console(
 struct Contexte {
     config: Arc<ConfigurationApplication>,
     tx_ui: mpsc::Sender<SignalVisuel>,
-    tx_statut: mpsc::UnboundedSender<(u64, String)>,
+    tx_statut: mpsc::UnboundedSender<(u64, NotificationMoteur)>,
     generation: u64,
     parametrages: Parametrages,
+    fournisseurs: Vec<Fournisseur>,
 }
 
 type Historiques = HashMap<String, Vec<Bougie>>;
@@ -354,7 +486,7 @@ type Historiques = HashMap<String, Vec<Bougie>>;
 async fn moteur(
     config: Arc<ConfigurationApplication>,
     tx_ui: mpsc::Sender<SignalVisuel>,
-    tx_statut: mpsc::UnboundedSender<(u64, String)>,
+    tx_statut: mpsc::UnboundedSender<(u64, NotificationMoteur)>,
     mut rx_commandes: mpsc::UnboundedReceiver<CommandeMoteur>,
 ) {
     let mut session: Option<JoinHandle<()>> = None;
@@ -372,6 +504,7 @@ async fn moteur(
             chemin_fichier,
             symboles_test,
             parametrages,
+            fournisseurs,
         } = commande
         else {
             continue;
@@ -383,6 +516,7 @@ async fn moteur(
             tx_statut: tx_statut.clone(),
             generation,
             parametrages,
+            fournisseurs,
         };
         session = Some(tokio::spawn(async move {
             let resultat = match mode {
@@ -398,7 +532,7 @@ async fn moteur(
             };
             if let Err(erreur) = resultat {
                 error!("{erreur}");
-                ctx.statut(format!("❌ {erreur}"));
+                ctx.echec(erreur);
             }
         }));
     }
@@ -406,7 +540,21 @@ async fn moteur(
 
 impl Contexte {
     fn statut(&self, texte: impl Into<String>) {
-        let _ = self.tx_statut.send((self.generation, texte.into()));
+        let _ = self
+            .tx_statut
+            .send((self.generation, NotificationMoteur::Statut(texte.into())));
+    }
+
+    fn erreur(&self, texte: impl Into<String>) {
+        let _ = self
+            .tx_statut
+            .send((self.generation, NotificationMoteur::Erreur(texte.into())));
+    }
+
+    fn echec(&self, texte: impl Into<String>) {
+        let _ = self
+            .tx_statut
+            .send((self.generation, NotificationMoteur::Echec(texte.into())));
     }
 
     fn delai_reseau(&self) -> Option<Duration> {
@@ -417,49 +565,203 @@ impl Contexte {
 
     async fn temps_reel(&self) -> Result<(), String> {
         let symboles = &self.config.paires.symboles;
+        let fournisseurs = &self.fournisseurs;
 
-        self.statut("Téléchargement de l'historique Binance...");
+        self.statut("Téléchargement de l'historique multi-sources...");
+        let mut bougies_sources = Vec::new();
+        let mut erreurs_sources = Vec::new();
+        for symbole in symboles {
+            let unite = &self.parametrages.resoudre(symbole).unite_temps;
+            for fournisseur in fournisseurs {
+                info!(
+                    "Téléchargement de l'historique {} pour {}...",
+                    fournisseur.libelle(),
+                    symbole
+                );
+                let delai = self.delai_reseau().unwrap_or_default();
+                let resultat = match fournisseur {
+                    Fournisseur::Binance => {
+                        telecharger_bougies_periode(
+                            symbole,
+                            unite,
+                            None,
+                            None,
+                            BOUGIES_PRECHAUFFAGE + 1,
+                            self.delai_reseau(),
+                        )
+                        .await
+                    }
+                    Fournisseur::Kraken => {
+                        crate::data::kraken::telecharger_historique(
+                            symbole,
+                            unite,
+                            BOUGIES_PRECHAUFFAGE,
+                            delai,
+                        )
+                        .await
+                    }
+                    Fournisseur::Coinbase => {
+                        crate::data::coinbase::telecharger_historique(
+                            symbole,
+                            unite,
+                            BOUGIES_PRECHAUFFAGE,
+                            delai,
+                        )
+                        .await
+                    }
+                };
+                match resultat {
+                    Ok(bougies) => {
+                        bougies_sources.extend(bougies.into_iter().map(|bougie| BougieSourcee {
+                            fournisseur: *fournisseur,
+                            bougie,
+                        }))
+                    }
+                    Err(erreur) => {
+                        let message = format!(
+                            "Historique {} indisponible pour {symbole} : {erreur}",
+                            fournisseur.libelle()
+                        );
+                        warn!("{message}");
+                        self.erreur(message.clone());
+                        erreurs_sources.push(message);
+                    }
+                }
+            }
+        }
+
+        let bougies_initiales: Vec<_> = bougies_sources
+            .iter()
+            .filter(|bougie| !bougie.bougie.cloturee)
+            .cloned()
+            .collect();
+        let bougies_agregees = agreger_historique(bougies_sources, fournisseurs);
         let mut historiques = Historiques::new();
         for symbole in symboles {
-            info!("Téléchargement de l'historique Binance pour {}...", symbole);
-            let unite = &self.parametrages.resoudre(symbole).unite_temps;
-            let mut bougies = telecharger_bougies_periode(
-                symbole,
-                unite,
-                None,
-                None,
-                BOUGIES_PRECHAUFFAGE,
-                self.delai_reseau(),
-            )
-            .await
-            .map_err(|e| format!("Historique Binance indisponible pour {symbole} : {e}"))?;
-            bougies.retain(|b| b.cloturee);
-            if bougies.is_empty() {
-                return Err(format!(
-                    "Binance n'a renvoyé aucune bougie clôturée pour {symbole}"
-                ));
+            let mut bougies: Vec<_> = bougies_agregees
+                .iter()
+                .filter(|bougie| bougie.symbole.eq_ignore_ascii_case(symbole))
+                .cloned()
+                .collect();
+            if bougies.len() < BOUGIES_PRECHAUFFAGE {
+                let mut message = format!(
+                    "Historique multi-sources insuffisant pour {symbole} : {} bougies agrégées sur {BOUGIES_PRECHAUFFAGE} requises",
+                    bougies.len()
+                );
+                if !erreurs_sources.is_empty() {
+                    message.push_str(&format!("; erreurs : {}", erreurs_sources.join(" | ")));
+                }
+                return Err(message);
             }
+            bougies.drain(..bougies.len() - BOUGIES_PRECHAUFFAGE);
             historiques.insert(symbole.to_uppercase(), bougies);
         }
 
         if !self.publier_dernieres(&historiques).await {
             return Ok(());
         }
-        self.statut("🔴 Flux Binance en direct");
-        info!("Flux Binance lancé. Traitement en temps réel activé...");
+        let libelles = fournisseurs
+            .iter()
+            .map(|fournisseur| fournisseur.libelle())
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.statut(format!("🔴 Flux en direct : {libelles}"));
+        info!("Flux multi-sources lancé. Traitement en temps réel activé...");
 
-        let (tx_bougies, rx_bougies) = mpsc::channel::<Bougie>(100);
+        let (tx_bougies, rx_bougies) = mpsc::channel::<BougieSourcee>(500);
         let mut flux = tokio::task::JoinSet::new();
         for (unite, groupe) in self.parametrages.par_unite(symboles) {
-            let tx = tx_bougies.clone();
-            flux.spawn(async move { ecouter_flux_temps_reel(&groupe, &unite, tx).await });
+            for fournisseur in fournisseurs {
+                match fournisseur {
+                    Fournisseur::Binance => {
+                        let (tx_binance, mut rx_binance) = mpsc::channel::<Bougie>(100);
+                        let tx = tx_bougies.clone();
+                        let groupe_ecoute = groupe.clone();
+                        let unite_ecoute = unite.clone();
+                        flux.spawn(async move {
+                            ecouter_flux_temps_reel(&groupe_ecoute, &unite_ecoute, tx_binance).await
+                        });
+                        flux.spawn(async move {
+                            while let Some(bougie) = rx_binance.recv().await {
+                                if tx
+                                    .send(BougieSourcee {
+                                        fournisseur: Fournisseur::Binance,
+                                        bougie,
+                                    })
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                        });
+                    }
+                    Fournisseur::Kraken => {
+                        let tx = tx_bougies.clone();
+                        let groupe = groupe.clone();
+                        let unite = unite.clone();
+                        flux.spawn(async move {
+                            crate::data::kraken::ecouter_flux_temps_reel(&groupe, &unite, tx).await
+                        });
+                    }
+                    Fournisseur::Coinbase => {
+                        let tx = tx_bougies.clone();
+                        let groupe = groupe.clone();
+                        let unite = unite.clone();
+                        flux.spawn(async move {
+                            crate::data::coinbase::ecouter_flux_temps_reel(&groupe, &unite, tx)
+                                .await
+                        });
+                    }
+                }
+            }
         }
         drop(tx_bougies);
         tokio::select! {
             _ = flux.join_all() => {}
-            _ = self.traiter_flux(&mut historiques, rx_bougies) => {}
+            _ = self.traiter_flux_agrege(&mut historiques, rx_bougies, fournisseurs, bougies_initiales) => {}
         }
         Ok(())
+    }
+
+    async fn traiter_flux_agrege(
+        &self,
+        historiques: &mut Historiques,
+        mut rx: mpsc::Receiver<BougieSourcee>,
+        fournisseurs: &[Fournisseur],
+        bougies_initiales: Vec<BougieSourcee>,
+    ) {
+        let mut agregateur = Agregateur::nouveau(fournisseurs, Duration::from_secs(5));
+        for bougie_sourcee in bougies_initiales {
+            if let Some(bougie) = agregateur.recevoir(bougie_sourcee)
+                && self
+                    .traiter_bougie(historiques, bougie, false)
+                    .await
+                    .is_none()
+            {
+                return;
+            }
+        }
+        let mut verification_delai = tokio::time::interval(Duration::from_millis(100));
+        loop {
+            tokio::select! {
+                reception = rx.recv() => {
+                    let Some(bougie_sourcee) = reception else { return };
+                    if let Some(bougie) = agregateur.recevoir(bougie_sourcee)
+                        && self.traiter_bougie(historiques, bougie, false).await.is_none()
+                    {
+                        return;
+                    }
+                }
+                _ = verification_delai.tick() => {
+                    for bougie in agregateur.emettre_expirees() {
+                        if self.traiter_bougie(historiques, bougie, false).await.is_none() {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     async fn simulation(&self) -> Result<(), String> {

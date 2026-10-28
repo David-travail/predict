@@ -1,6 +1,15 @@
 //! Proxy HTTP partagé par les clients REST et WebSocket.
 
+use std::error::Error;
 use std::sync::OnceLock;
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::time::timeout;
+use tokio_tungstenite::tungstenite::handshake::client::Response;
+use tokio_tungstenite::{
+    MaybeTlsStream, WebSocketStream, client_async_tls_with_config, connect_async,
+};
 
 static PROXY_CONFIGURE: OnceLock<Option<String>> = OnceLock::new();
 
@@ -44,6 +53,43 @@ pub fn client_http() -> Result<reqwest::Client, reqwest::Error> {
         constructeur = constructeur.proxy(reqwest::Proxy::all(proxy)?);
     }
     constructeur.build()
+}
+
+pub async fn ouvrir_websocket(
+    url: &str,
+    hote: &str,
+) -> Result<(WebSocketStream<MaybeTlsStream<TcpStream>>, Response), Box<dyn Error>> {
+    let Some(proxy) = proxy() else {
+        return Ok(connect_async(url).await?);
+    };
+
+    let adresse = adresse_proxy(&proxy);
+    let mut tcp = timeout(Duration::from_secs(15), TcpStream::connect(&adresse))
+        .await
+        .map_err(|_| format!("délai dépassé en se connectant au proxy {adresse}"))??;
+
+    let requete = format!("CONNECT {hote} HTTP/1.1\r\nHost: {hote}\r\n\r\n");
+    tcp.write_all(requete.as_bytes()).await?;
+
+    let mut reponse = Vec::new();
+    let mut octet = [0u8; 1];
+    while !reponse.ends_with(b"\r\n\r\n") {
+        if reponse.len() > 8192 || tcp.read(&mut octet).await? == 0 {
+            return Err("réponse invalide du proxy au CONNECT".into());
+        }
+        reponse.push(octet[0]);
+    }
+    let entete = String::from_utf8_lossy(&reponse);
+    let statut = entete.lines().next().unwrap_or_default();
+    if !statut
+        .split_whitespace()
+        .nth(1)
+        .is_some_and(|code| code == "200")
+    {
+        return Err(format!("le proxy a refusé le tunnel : {statut}").into());
+    }
+
+    Ok(client_async_tls_with_config(url, tcp, None, None).await?)
 }
 
 #[cfg(test)]

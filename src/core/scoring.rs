@@ -15,7 +15,11 @@ mod tests {
     use super::calculer_score;
     use crate::core::modeles::{AnalyseTechnique, Tendance};
 
-    fn creer_analyse(tendance: Tendance, adx_valide: bool, volume_valide: bool) -> AnalyseTechnique {
+    fn creer_analyse(
+        tendance: Tendance,
+        adx_valide: bool,
+        volume_valide: bool,
+    ) -> AnalyseTechnique {
         AnalyseTechnique {
             tendance,
             valeur_adx: 0.0,
@@ -29,9 +33,18 @@ mod tests {
     fn calcule_le_score_et_verifie_le_seuil_alerte() {
         let h = Tendance::Haussiere;
         let b = Tendance::Baissiere;
-        assert_eq!(calculer_score(&creer_analyse(h, true, true), 80), (100, true));
-        assert_eq!(calculer_score(&creer_analyse(b, true, true), 80), (100, true));
-        assert_eq!(calculer_score(&creer_analyse(h, false, true), 80), (70, false));
+        assert_eq!(
+            calculer_score(&creer_analyse(h, true, true), 80),
+            (100, true)
+        );
+        assert_eq!(
+            calculer_score(&creer_analyse(b, true, true), 80),
+            (100, true)
+        );
+        assert_eq!(
+            calculer_score(&creer_analyse(h, false, true), 80),
+            (70, false)
+        );
         assert_eq!(
             calculer_score(&creer_analyse(Tendance::Neutre, true, true), 0),
             (0, true)

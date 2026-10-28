@@ -1,16 +1,51 @@
 DÉTECTEUR CRYPTO H24 - OPTIONS DE LANCEMENT
 ===========================================
 
-Interface graphique (par défaut)
---------------------------------
-  - Double-clic sur predict.exe (aucune console ne s'ouvre), ou :
-        predict.exe
+Serveur moteur et interface graphique séparés
+---------------------------------------------
+  1. Dans la console du moteur, définir le même jeton secret que pour l'IHM :
+        $env:PREDICT_TOKEN = "votre-jeton-secret-de-16-caracteres-minimum"
+        .\predict.exe --serve
+        Ou avec Cargo, depuis le dossier du projet :
+           cargo run -- --serve
 
-Mode console
-------------
+     Le serveur écoute par défaut sur 0.0.0.0:8765 et démarre en temps réel.
+     Adresse personnalisée :
+           .\predict.exe --serve --listen 0.0.0.0:8765
+     Avec Cargo :
+           cargo run -- --serve --listen 0.0.0.0:8765
+
+     2. Sur le même ordinateur, dans une autre console, ou par double-clic si
+        PREDICT_TOKEN est déjà défini :
+           .\predict.exe
+        Ou avec Cargo, dans une autre console :
+           cargo run
+
+     L'IHM se connecte par défaut à 127.0.0.1:8765.
+     Pour un moteur sur un autre ordinateur :
+           $env:PREDICT_TOKEN = "le-meme-jeton-secret"
+           .\predict.exe --connect 192.168.1.10:8765
+     Avec Cargo :
+           cargo run -- --connect 192.168.1.10:8765
+
+  L'IHM peut changer de mode et piloter le moteur. Fermer l'IHM ne l'arrête pas ;
+  seul Ctrl+C dans la console du serveur arrête le moteur.
+
+Mode local : moteur et IHM ensemble
+-----------------------------------
+  .\predict.exe --local
+  Avec Cargo, depuis le dossier du projet :
+        cargo run -- --local
+
+  Le moteur et l'IHM démarrent dans la même application. Fermer la fenêtre de
+  l'IHM arrête également le moteur et ses flux.
+
+Analyse console autonome (sans serveur)
+---------------------------------------
   predict.exe --console [--mode <MODE>] [options]
 
   --console            Lance en mode console, sans interface graphique
+  --local              Lance moteur et IHM ensemble ; fermeture = arrêt des deux
   --mode <MODE>        temps-reel (défaut) | simulation | periode | fichier
   --debut AAAA-MM-JJ   Date de début           (requis avec --mode periode)
   --fin AAAA-MM-JJ     Date de fin, incluse    (requis avec --mode periode)
@@ -20,6 +55,10 @@ Mode console
   -V, --version        Affiche la version
 
   --mode, --debut, --fin et --fichier ne fonctionnent qu'avec --console.
+  --serve              Lance le moteur contrôlable par l'IHM
+  --listen <IP:PORT>   Adresse d'écoute (défaut : 0.0.0.0:8765, avec --serve)
+  --connect <IP:PORT>  Adresse du serveur pour l'IHM (défaut : 127.0.0.1:8765)
+  PREDICT_TOKEN        Jeton partagé requis par le serveur et l'IHM
 
 Exemples
 --------
@@ -43,6 +82,7 @@ Remarques
 ---------
   - config.toml est lu dans le dossier courant : lancez l'exe depuis le dossier
     qui le contient (un double-clic le fait automatiquement).
+  - Le jeton TCP n'est pas chiffré : utilisez un réseau privé de confiance ou un VPN.
   - Les modes periode et fichier se terminent seuls ; le code de sortie est
     différent de 0 en cas d'erreur.
-  - En mode graphique, il n'y a pas de logs console.
+  - L'IHM nécessite qu'un serveur soit déjà démarré et que PREDICT_TOKEN soit défini.

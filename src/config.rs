@@ -1,5 +1,6 @@
 //! Parsing et validation de la configuration de l'application à partir de `config.toml`.
 
+use crate::data::sources::Fournisseur;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -17,12 +18,33 @@ pub struct ConfigurationApplication {
     pub strategie: ConfigurationStrategie,
     #[serde(rename = "network")]
     pub reseau: ConfigurationReseau,
+    #[serde(rename = "data_sources", default)]
+    pub sources_donnees: ConfigurationSources,
     /// Blocs de paires (`[groups.<nom>]`), chacun avec son paramétrage optionnel.
     #[serde(rename = "groups", default)]
     pub groupes: BTreeMap<String, ConfigurationGroupe>,
     /// Paramétrage propre à une paire (`[overrides.<SYMBOLE>]`).
     #[serde(rename = "overrides", default)]
     pub surcharges: BTreeMap<String, ConfigurationStrategie>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ConfigurationSources {
+    #[serde(rename = "providers")]
+    pub fournisseurs: Vec<Fournisseur>,
+}
+
+impl Default for ConfigurationSources {
+    fn default() -> Self {
+        Self {
+            fournisseurs: vec![
+                Fournisseur::Binance,
+                Fournisseur::Kraken,
+                Fournisseur::Coinbase,
+            ],
+        }
+    }
 }
 
 /// Liste des paires/symboles à surveiller (section `[pairs]`).
@@ -148,6 +170,15 @@ impl ConfigurationApplication {
 
         if self.unites_temps.unite_execution.trim().is_empty() {
             return Err("'timeframes.execution' ne peut pas être vide".into());
+        }
+
+        if self.sources_donnees.fournisseurs.is_empty() {
+            return Err("'data_sources.providers' ne peut pas être vide".into());
+        }
+        let fournisseurs: std::collections::HashSet<_> =
+            self.sources_donnees.fournisseurs.iter().collect();
+        if fournisseurs.len() != self.sources_donnees.fournisseurs.len() {
+            return Err("'data_sources.providers' ne peut pas contenir de doublons".into());
         }
 
         self.parametrages().valider()
@@ -440,6 +471,45 @@ mod tests {
         assert_eq!(configuration.strategie.adx.periode, 14);
         assert_eq!(configuration.strategie.volume.periode_moyenne_mobile, 20);
         assert_eq!(configuration.reseau.delai_limitation_debit_ms, 200);
+        assert_eq!(
+            configuration.sources_donnees.fournisseurs,
+            vec![
+                Fournisseur::Binance,
+                Fournisseur::Kraken,
+                Fournisseur::Coinbase
+            ]
+        );
+    }
+
+    #[test]
+    fn valide_la_configuration_reelle_avec_les_trois_sources() {
+        let configuration =
+            ConfigurationApplication::depuis_toml(include_str!("../config.toml")).unwrap();
+        assert_eq!(
+            configuration.sources_donnees.fournisseurs,
+            vec![
+                Fournisseur::Binance,
+                Fournisseur::Kraken,
+                Fournisseur::Coinbase
+            ]
+        );
+    }
+
+    #[test]
+    fn lit_les_fournisseurs_de_donnees_configures() {
+        let toml = toml_exemple().replace(
+            "[network]",
+            "[data_sources]\nproviders = [\"binance\", \"kraken\", \"coinbase\"]\n\n[network]",
+        );
+        let configuration = ConfigurationApplication::depuis_toml(&toml).unwrap();
+        assert_eq!(
+            configuration.sources_donnees.fournisseurs,
+            vec![
+                Fournisseur::Binance,
+                Fournisseur::Kraken,
+                Fournisseur::Coinbase
+            ]
+        );
     }
 
     #[test]
@@ -504,6 +574,17 @@ mod tests {
     fn rejette_un_score_minimal_alerte_invalide() {
         let mut configuration: ConfigurationApplication = toml::from_str(toml_exemple()).unwrap();
         configuration.strategie.score_min_alerte = 150;
+        assert!(configuration.valider().is_err());
+    }
+
+    #[test]
+    fn rejette_les_fournisseurs_vides_ou_dupliques() {
+        let mut configuration: ConfigurationApplication = toml::from_str(toml_exemple()).unwrap();
+        configuration.sources_donnees.fournisseurs.clear();
+        assert!(configuration.valider().is_err());
+
+        configuration.sources_donnees.fournisseurs =
+            vec![Fournisseur::Binance, Fournisseur::Binance];
         assert!(configuration.valider().is_err());
     }
 }

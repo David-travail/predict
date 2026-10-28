@@ -1,12 +1,13 @@
 use crate::config::{ConfigurationStrategie, Parametrages, Portee};
 use crate::core::modeles::Tendance;
+use crate::data::sources::Fournisseur;
 use chrono::{Datelike, Duration, NaiveDate};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 use std::time::Instant;
 use tokio::sync::mpsc::{Receiver, UnboundedReceiver, UnboundedSender};
 
-#[derive(Debug, PartialEq, Clone, Copy)]
+#[derive(Debug, PartialEq, Clone, Copy, Serialize, Deserialize)]
 pub enum ModeExecution {
     TempsReel,
     Simulation,
@@ -14,10 +15,23 @@ pub enum ModeExecution {
     BacktestFichier,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum NotificationMoteur {
+    Statut(String),
+    Erreur(String),
+    Echec(String),
+}
+
 /// Ordre envoyé par l'IHM au moteur Tokio.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum CommandeMoteur {
-    Arreter,
+    Arreter {
+        generation: u64,
+        mode: ModeExecution,
+    },
+    SauvegarderParametrages {
+        parametrages: Parametrages,
+    },
     Demarrer {
         generation: u64,
         mode: ModeExecution,
@@ -26,10 +40,11 @@ pub enum CommandeMoteur {
         chemin_fichier: String,
         symboles_test: Vec<String>,
         parametrages: Parametrages,
+        fournisseurs: Vec<Fournisseur>,
     },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SignalVisuel {
     /// Numéro de session : les signaux d'un ancien mode sont ignorés par l'IHM.
     pub generation: u64,
@@ -196,12 +211,12 @@ pub struct ApplicationCryptobot {
     pub chemin_fichier_test: String,
     /// Paramètres de calcul modifiables ; envoyés au moteur à chaque (re)lancement.
     pub parametrages: Parametrages,
+    fournisseurs: Vec<Fournisseur>,
     /// Portée (générique, bloc ou paire) actuellement éditée.
     portee: Portee,
     symboles: Vec<String>,
     symboles_test_disponibles: Vec<String>,
     symboles_test: HashSet<String>,
-    chemin_parametrages: PathBuf,
     pub generation: u64,
     pub statut: String,
     /// Alerte cliquée dans le journal : sa paire affiche les données de cette alerte.
@@ -210,15 +225,16 @@ pub struct ApplicationCryptobot {
     nb_messages: u64,
     dernier_message: Option<Instant>,
     tx_commandes: Option<UnboundedSender<CommandeMoteur>>,
-    rx_statut: Option<UnboundedReceiver<(u64, String)>>,
+    rx_statut: Option<UnboundedReceiver<(u64, NotificationMoteur)>>,
+    erreur_dialogue: Option<String>,
 }
 
 impl ApplicationCryptobot {
     pub fn new(
         rx_mpsc: Receiver<SignalVisuel>,
         parametrages: Parametrages,
+        fournisseurs: Vec<Fournisseur>,
         symboles: Vec<String>,
-        chemin_parametrages: PathBuf,
     ) -> Self {
         let mut symboles_test_disponibles = symboles.clone();
         symboles_test_disponibles.extend(parametrages.paires.keys().cloned());
@@ -234,11 +250,11 @@ impl ApplicationCryptobot {
 
         Self {
             parametrages,
+            fournisseurs,
             portee: Portee::Generique,
             symboles_test: symboles.iter().map(|s| s.to_uppercase()).collect(),
             symboles,
             symboles_test_disponibles,
-            chemin_parametrages,
             rx_mpsc,
             paires: HashMap::new(),
             journal_alertes: Vec::new(),
@@ -257,6 +273,7 @@ impl ApplicationCryptobot {
             dernier_message: None,
             tx_commandes: None,
             rx_statut: None,
+            erreur_dialogue: None,
         }
     }
 
@@ -264,10 +281,37 @@ impl ApplicationCryptobot {
     pub fn avec_moteur(
         mut self,
         tx_commandes: UnboundedSender<CommandeMoteur>,
-        rx_statut: UnboundedReceiver<(u64, String)>,
+        rx_statut: UnboundedReceiver<(u64, NotificationMoteur)>,
     ) -> Self {
         self.tx_commandes = Some(tx_commandes);
         self.rx_statut = Some(rx_statut);
+        self
+    }
+
+    pub fn avec_etat_initial(
+        mut self,
+        generation: u64,
+        mode: ModeExecution,
+        signaux: Vec<SignalVisuel>,
+        statut: Option<(u64, NotificationMoteur)>,
+    ) -> Self {
+        self.generation = generation;
+        self.mode_actif = mode;
+        for signal in signaux {
+            if signal.generation == generation {
+                self.paires.insert(signal.symbole.clone(), signal);
+            }
+        }
+        if let Some((generation_statut, notification)) = statut {
+            if generation_statut == generation {
+                match notification {
+                    NotificationMoteur::Statut(texte) => self.statut = texte,
+                    NotificationMoteur::Erreur(texte) | NotificationMoteur::Echec(texte) => {
+                        self.erreur_dialogue = Some(texte);
+                    }
+                }
+            }
+        }
         self
     }
 
@@ -283,9 +327,11 @@ impl ApplicationCryptobot {
         while self.rx_mpsc.try_recv().is_ok() {}
     }
 
-    fn envoyer(&self, commande: CommandeMoteur) {
+    fn envoyer(&mut self, commande: CommandeMoteur) {
         if let Some(tx) = &self.tx_commandes {
-            let _ = tx.send(commande);
+            if tx.send(commande).is_err() {
+                self.statut = "Connexion au moteur perdue.".to_string();
+            }
         }
     }
 
@@ -296,14 +342,17 @@ impl ApplicationCryptobot {
         match self.mode_actif {
             ModeExecution::TempsReel | ModeExecution::Simulation => self.lancer(),
             ModeExecution::BacktestPeriode | ModeExecution::BacktestFichier => {
-                self.envoyer(CommandeMoteur::Arreter);
+                self.envoyer(CommandeMoteur::Arreter {
+                    generation: self.generation,
+                    mode: self.mode_actif,
+                });
                 self.statut =
                     "Renseignez les paramètres puis cliquez sur « Charger & Lancer ».".to_string();
             }
         }
     }
 
-    fn lancer(&self) {
+    fn lancer(&mut self) {
         self.envoyer(CommandeMoteur::Demarrer {
             generation: self.generation,
             mode: self.mode_actif,
@@ -317,6 +366,7 @@ impl ApplicationCryptobot {
                 .cloned()
                 .collect(),
             parametrages: self.parametrages.clone(),
+            fournisseurs: self.fournisseurs.clone(),
         });
     }
 }
@@ -497,10 +547,37 @@ impl eframe::App for ApplicationCryptobot {
             self.paires.insert(signal.symbole.clone(), signal);
         }
         if let Some(rx) = &mut self.rx_statut {
-            while let Ok((generation, texte)) = rx.try_recv() {
+            while let Ok((generation, notification)) = rx.try_recv() {
                 if generation == self.generation {
-                    self.statut = texte;
+                    match notification {
+                        NotificationMoteur::Statut(texte) => self.statut = texte,
+                        NotificationMoteur::Erreur(texte) | NotificationMoteur::Echec(texte) => {
+                            if let Some(erreur) = &mut self.erreur_dialogue {
+                                erreur.push('\n');
+                                erreur.push_str(&texte);
+                            } else {
+                                self.erreur_dialogue = Some(texte);
+                            }
+                        }
+                    }
                 }
+            }
+        }
+
+        if let Some(erreur) = self.erreur_dialogue.clone() {
+            let mut fermer = false;
+            egui::Window::new("Erreur de source de données")
+                .collapsible(false)
+                .resizable(true)
+                .default_width(520.0)
+                .show(ctx, |ui| {
+                    ui.label(erreur);
+                    if ui.button("Fermer").clicked() {
+                        fermer = true;
+                    }
+                });
+            if fermer {
+                self.erreur_dialogue = None;
             }
         }
 
@@ -508,6 +585,7 @@ impl eframe::App for ApplicationCryptobot {
 
         let mode_avant = self.mode_actif;
         let mut lancer_test = false;
+        let mut fournisseurs_modifies = false;
 
         // 2. BARRE SUPÉRIEURE : Sélection du mode & Seuil
         egui::TopBottomPanel::top("en_tete").show(ctx, |ui| {
@@ -542,7 +620,7 @@ impl eframe::App for ApplicationCryptobot {
                 // Menu déroulant pour le choix du mode
                 egui::ComboBox::from_label("Mode")
                     .selected_text(match self.mode_actif {
-                        ModeExecution::TempsReel => "🔴 Temps Réel (Binance)",
+                        ModeExecution::TempsReel => "🔴 Temps Réel (multi-sources)",
                         ModeExecution::Simulation => "🟡 Simulation Locale",
                         ModeExecution::BacktestPeriode => "🔵 Test Historique (REST)",
                         ModeExecution::BacktestFichier => "📁 Fichier Local (JSON)",
@@ -551,7 +629,7 @@ impl eframe::App for ApplicationCryptobot {
                         ui.selectable_value(
                             &mut self.mode_actif,
                             ModeExecution::TempsReel,
-                            "🔴 Temps Réel (Binance)",
+                            "🔴 Temps Réel (multi-sources)",
                         );
                         ui.selectable_value(
                             &mut self.mode_actif,
@@ -570,6 +648,35 @@ impl eframe::App for ApplicationCryptobot {
                         );
                     });
             });
+
+            if self.mode_actif == ModeExecution::TempsReel {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Flux de données :");
+                    for (fournisseur, libelle) in [
+                        (Fournisseur::Binance, "Binance"),
+                        (Fournisseur::Kraken, "Kraken"),
+                        (Fournisseur::Coinbase, "Coinbase"),
+                    ] {
+                        let mut actif = self.fournisseurs.contains(&fournisseur);
+                        if ui
+                            .add_enabled(
+                                !actif || self.fournisseurs.len() > 1,
+                                egui::Checkbox::new(&mut actif, libelle),
+                            )
+                            .changed()
+                        {
+                            if actif {
+                                if !self.fournisseurs.contains(&fournisseur) {
+                                    self.fournisseurs.push(fournisseur);
+                                }
+                            } else {
+                                self.fournisseurs.retain(|f| *f != fournisseur);
+                            }
+                            fournisseurs_modifies = true;
+                        }
+                    }
+                });
+            }
 
             // Barre de sous-menu dynamique pour le Backtest / Test
             if self.mode_actif == ModeExecution::BacktestPeriode
@@ -716,13 +823,10 @@ impl eframe::App for ApplicationCryptobot {
                 self.parametrages.propager(&self.portee, &self.symboles);
             }
             if sauvegarder {
-                self.statut = match self.parametrages.sauvegarder(&self.chemin_parametrages) {
-                    Ok(()) => format!(
-                        "💾 Paramétrages sauvegardés : {}",
-                        self.chemin_parametrages.display()
-                    ),
-                    Err(erreur) => format!("❌ Sauvegarde impossible : {erreur}"),
-                };
+                self.statut = "Sauvegarde des paramétrages sur le moteur...".to_string();
+                self.envoyer(CommandeMoteur::SauvegarderParametrages {
+                    parametrages: self.parametrages.clone(),
+                });
             }
 
             let mut s = self.parametrages.lire(&self.portee);
@@ -775,6 +879,10 @@ impl eframe::App for ApplicationCryptobot {
 
         if self.mode_actif != mode_avant {
             self.changer_de_mode();
+        } else if fournisseurs_modifies {
+            self.reinitialiser();
+            self.statut = "Redémarrage avec les flux sélectionnés...".to_string();
+            self.lancer();
         } else if lancer_test {
             if self.symboles_test.is_empty() {
                 self.statut = "Sélectionnez au moins une paire à jouer.".to_string();

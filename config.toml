@@ -1,5 +1,6 @@
 [pairs]
 symbols = ["BTCEUR", "ETHEUR", "XRPEUR", "SOLEUR"]
+#symbols = ["BTCEUR"]
 
 [timeframes]
 execution = "1h"
@@ -24,6 +25,9 @@ multiplier = 1.2
 [network]
 rate_limit_ms = 200
 proxy = "http://127.0.0.1:9000"
+
+[data_sources]
+providers = ["binance", "kraken", "coinbase"]
 
 # Bloc de paires : paramétrage commun (optionnel) ; priorité : paire > bloc > [strategy].
 # [groups.majeures]

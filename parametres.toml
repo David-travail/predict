@@ -19,73 +19,73 @@ multiplier = 1.2
 [groups]
 
 [overrides.BTCEUR]
-min_score_alert = 80
-timeframe = "1h"
+min_score_alert = 85
+timeframe = "1d"
 
 [overrides.BTCEUR.macro_filter]
 ema_period = 200
 use_supertrend = true
 supertrend_period = 10
-supertrend_multiplier = 3.0
+supertrend_multiplier = 3.5
 
 [overrides.BTCEUR.adx]
 period = 14
-min_threshold = 22.0
+min_threshold = 28.0
 
 [overrides.BTCEUR.volume]
 sma_period = 20
-multiplier = 1.2
+multiplier = 1.5
 
 [overrides.ETHEUR]
-min_score_alert = 80
-timeframe = "1h"
+min_score_alert = 85
+timeframe = "1d"
 
 [overrides.ETHEUR.macro_filter]
 ema_period = 200
 use_supertrend = true
 supertrend_period = 10
-supertrend_multiplier = 3.0
+supertrend_multiplier = 3.5
 
 [overrides.ETHEUR.adx]
 period = 14
-min_threshold = 22.0
+min_threshold = 28.0
 
 [overrides.ETHEUR.volume]
 sma_period = 20
-multiplier = 1.2
+multiplier = 1.5
 
 [overrides.SOLEUR]
-min_score_alert = 80
-timeframe = "1h"
+min_score_alert = 85
+timeframe = "1d"
 
 [overrides.SOLEUR.macro_filter]
 ema_period = 200
 use_supertrend = true
 supertrend_period = 10
-supertrend_multiplier = 3.0
+supertrend_multiplier = 3.5
 
 [overrides.SOLEUR.adx]
 period = 14
-min_threshold = 22.0
+min_threshold = 28.0
 
 [overrides.SOLEUR.volume]
 sma_period = 20
-multiplier = 1.2
+multiplier = 1.5
 
 [overrides.XRPEUR]
-min_score_alert = 80
-timeframe = "1h"
+min_score_alert = 85
+timeframe = "1d"
 
 [overrides.XRPEUR.macro_filter]
 ema_period = 200
 use_supertrend = true
 supertrend_period = 10
-supertrend_multiplier = 3.0
+supertrend_multiplier = 3.5
 
 [overrides.XRPEUR.adx]
 period = 14
-min_threshold = 22.0
+min_threshold = 28.0
 
 [overrides.XRPEUR.volume]
 sma_period = 20
-multiplier = 1.2
+multiplier = 1.5

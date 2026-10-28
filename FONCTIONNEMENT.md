@@ -48,19 +48,37 @@ Valeurs par défaut (`config.toml`) : unité `1h`, EMA 200 + Supertrend, ADX 14 
 ## 2. Fonctionnement de l'application
 
 ### Architecture
-- `main.rs` : lit `config.toml`, lance un **moteur** Tokio (une session à la fois, remplacée à chaque commande de l'IHM) ; egui occupe le thread principal. Sans argument : interface graphique ; avec `--console` : mode console.
-- Communication par canaux : `SignalVisuel` (moteur → IHM), `CommandeMoteur::Demarrer` (IHM → moteur), statuts texte.
-- Modes : **temps-reel** (Binance), **simulation** (prix fictifs), **periode** (backtest téléchargé, sauvegardé dans `historique_<début>_<fin>.json`), **fichier** (rejeu d'un JSON). L'unité de temps des bougies (`timeframes.execution`, 1h par défaut) est modifiable dans l'IHM (liste « Période » : 1m … 1d, prise en compte par « Appliquer »). Proxy HTTP possible (`[network] proxy`), délai minimal entre appels REST `rate_limit_ms` (200 ms).
+- `predict --serve` lance le moteur Tokio et son serveur de contrôle réseau dans la console ; l'IHM lancée séparément se connecte au moteur (`predict` par défaut sur `127.0.0.1:8765`, ou `predict --connect <IP>:8765`). Le serveur écoute par défaut sur `0.0.0.0:8765` ; `--listen` permet de choisir une autre adresse. L'IHM peut changer de mode et arrêter/redémarrer le traitement. Fermer ou perdre l'IHM ne coupe pas le moteur ; seul `Ctrl+C` dans la console du serveur l'arrête.
+- `predict --local` lance le moteur et l'IHM ensemble dans le même processus, sans serveur réseau ; fermer la fenêtre de l'IHM arrête également le moteur.
+- Le serveur exige le même secret dans la variable d'environnement `PREDICT_TOKEN` côté moteur et côté IHM (au moins 16 caractères). Les messages sont échangés en TCP/JSON ; le trafic n'est pas chiffré, donc utiliser un réseau privé de confiance ou un VPN.
+- « Sauvegarder » écrit les paramétrages sur la machine du moteur ; ils seront rechargés au prochain démarrage du serveur.
+- `predict --console` reste disponible pour une analyse console autonome (sans serveur ni IHM).
+- Les signaux et statuts du moteur sont transmis à l'IHM ; les erreurs des sources sont journalisées et affichées dans une boîte de dialogue ; la barre d'état du temps réel n'affiche que les noms des flux actifs.
+- Les logs de niveau INFO et supérieur sont affichés dans la console et ajoutés à `predict.log` dans le dossier de lancement de l'application.
+- Modes : **temps-reel** (sources activées dans `[data_sources]` : Binance, Kraken et Coinbase), **simulation** (prix fictifs), **periode** (backtest téléchargé depuis Binance, sauvegardé dans `historique_<début>_<fin>.json`), **fichier** (rejeu d'un JSON). L'unité de temps des bougies (`timeframes.execution`, 1h par défaut) est modifiable dans l'IHM (liste « Période » : 1m … 1d, prise en compte par « Appliquer »). Proxy HTTP possible (`[network] proxy`), délai minimal entre appels REST `rate_limit_ms` (200 ms).
+
+### Sources de données en temps réel
+
+Les trois fournisseurs sont activés par défaut. En mode Temps réel, les cases à cocher « Flux de données » permettent de choisir les sources ; chaque changement relance la connexion avec la sélection. Il faut garder au moins un fournisseur actif. La sélection initiale se règle aussi dans `config.toml` :
+
+```toml
+[data_sources]
+providers = ["binance", "kraken", "coinbase"]
+```
+
+Les bougies sont ramenées au symbole interne (par exemple `BTCEUR`) puis rapprochées par symbole, période et heure d'ouverture. Une bougie est agrégée dès que toutes les sources sélectionnées sont présentes, ou après 5 secondes si au moins deux sources concordent. Avec une seule source sélectionnée, ses bougies sont utilisées telles quelles. Ouverture, haut, bas et clôture sont les moyennes arithmétiques des sources reçues ; le volume est leur somme. Les mises à jour de sources supplémentaires sont intégrées tant que la bougie n'est pas clôturée. Si plusieurs sources sont sélectionnées, le démarrage requiert assez d'historique commun depuis au moins deux d'entre elles.
+
+Coinbase publie des transactions ; l'application reconstruit les bougies sur l'unité de temps configurée. Kraken publie ses bougies OHLC et Binance ses kline. Le préchauffage REST est téléchargé sur chaque source et la bougie courante est amorcée avec les valeurs REST avant le branchement des WebSockets ; les backtests par période restent actuellement basés sur Binance. Les trois API couvrent en commun `1m`, `5m`, `15m`, `1h` et `1d`. Les autres périodes dépendent des intervalles offerts par les fournisseurs ; le préchauffage doit obtenir 200 bougies concordantes sur au moins deux sources, sinon le démarrage échoue explicitement.
 
 ### Messages de l'API Binance
 
-**REST – historique** : `GET https://api.binance.com/api/v3/klines?symbol=…&interval=1h&limit=…[&startTime=…&endTime=…]`
+**REST – historique Binance** : `GET https://api.binance.com/api/v3/klines?symbol=…&interval=1h&limit=…[&startTime=…&endTime=…]`
 - Réponse : tableau de tableaux `[ouverture_ms, "open", "high", "low", "close", "volume", clôture_ms, …]` (≥ 7 champs ; prix et volume sont des chaînes).
 - Convertie en `Bougie` ; `cloturee = (instant de clôture < maintenant)`.
 - Limite 1000 bougies par appel ; une plage longue est paginée (curseur = dernière ouverture + 1 ms).
 - Au démarrage en temps réel : **200 bougies de préchauffage** par paire (nécessaires à l'EMA 200 et à l'ADX), seules les bougies clôturées sont gardées.
 
-**WebSocket – temps réel** : `wss://stream.binance.com:443/stream?streams=btceur@kline_1h/ethusdt@kline_1h/…` (flux combiné, un flux par paire).
+**WebSocket Binance – temps réel** : `wss://stream.binance.com:443/stream?streams=btceur@kline_1h/ethusdt@kline_1h/…` (flux combiné, un flux par paire).
 - Message : `{"stream":"btceur@kline_1h","data":{"e":"kline","s":"BTCEUR","k":{"t":…,"s":…,"i":"1h","o":…,"h":…,"l":…,"c":…,"v":…,"x":true|false}}}`.
 - `e != "kline"` : ignoré. `k.x` = `true` → bougie **clôturée** ; `false` → bougie **en cours** (mise à jour environ toutes les 2 s).
 - Ping serveur (toutes les 20 s) → Pong ; plus de 60 s sans message → connexion jugée morte.
@@ -116,4 +134,4 @@ IHM egui (update) ◄──canal SignalVisuel (256)─────────�
    - rouge : ≥ 60 s (flux probablement coupé, reconnexion en cours).
    Le compteur est remis à zéro à chaque changement de mode. Il compte les signaux traités, pas les messages WebSocket bruts (les événements ignorés ne le font pas avancer).
 3. Le signal remplace la dernière valeur de la paire ; s'il est une alerte, il est inséré en tête du journal (5000 max).
-4. Les messages de statut (`🔴 Flux Binance en direct`, `❌ erreur`, `✅ test terminé`…) arrivent par un canal séparé et sont affichés dans la barre d'état.
+4. Les statuts d'exécution et notifications d'erreur arrivent par un canal séparé. Les erreurs des sources sont journalisées (`warn`/`error`) et présentées dans une boîte de dialogue ; la barre d'état en direct conserve uniquement les noms des flux actifs. Les statuts normaux restent affichés dans la barre d'état.
