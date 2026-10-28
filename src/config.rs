@@ -36,6 +36,9 @@ pub struct ConfigurationSources {
 }
 
 impl Default for ConfigurationSources {
+    /// Construit la configuration de sources avec les trois fournisseurs actifs.
+    ///
+    /// Sortie : configuration par défaut contenant Binance, Kraken et Coinbase.
     fn default() -> Self {
         Self {
             fournisseurs: vec![
@@ -75,6 +78,9 @@ pub struct ConfigurationStrategie {
     pub unite_temps: String,
 }
 
+/// Fournit l'unité de temps utilisée par défaut lorsqu'elle n'est pas configurée.
+///
+/// Sortie : chaîne `1h`.
 fn unite_temps_defaut() -> String {
     "1h".to_string()
 }
@@ -95,10 +101,16 @@ pub struct ConfigurationMacro {
     pub multiplicateur_supertrend: f64,
 }
 
+/// Fournit la période Supertrend par défaut.
+///
+/// Sortie : période de 10 bougies.
 fn periode_supertrend_defaut() -> u32 {
     10
 }
 
+/// Fournit le multiplicateur Supertrend par défaut.
+///
+/// Sortie : multiplicateur `3.0`.
 fn multiplicateur_supertrend_defaut() -> f64 {
     3.0
 }
@@ -134,6 +146,9 @@ pub struct ConfigurationReseau {
 impl ConfigurationApplication {
     /// Charge et parse la configuration depuis un fichier TOML sur disque,
     /// puis la valide.
+    ///
+    /// Entrée : chemin du fichier TOML.
+    /// Sortie : configuration validée ou erreur de lecture, de parsing ou de validation.
     pub fn charger_config(chemin: &Path) -> Result<Self, Box<dyn Error>> {
         let contenu = fs::read_to_string(chemin).map_err(|erreur| {
             format!(
@@ -156,6 +171,9 @@ impl ConfigurationApplication {
     }
 
     /// Parse et valide une configuration TOML déjà en mémoire.
+    ///
+    /// Entrée : contenu TOML.
+    /// Sortie : configuration validée ou erreur de parsing/validation.
     pub fn depuis_toml(contenu: &str) -> Result<Self, Box<dyn Error>> {
         let configuration: ConfigurationApplication = toml::from_str(contenu)?;
         configuration.valider()?;
@@ -163,6 +181,9 @@ impl ConfigurationApplication {
     }
 
     /// Valide la cohérence des valeurs de configuration.
+    ///
+    /// Entrée : configuration courante.
+    /// Sortie : `Ok(())` si les paires, fournisseurs, périodes et stratégies sont valides.
     pub fn valider(&self) -> Result<(), Box<dyn Error>> {
         if self.paires.symboles.is_empty() {
             return Err("La liste 'pairs.symbols' ne peut pas être vide".into());
@@ -184,7 +205,10 @@ impl ConfigurationApplication {
         self.parametrages().valider()
     }
 
-    /// Paramétrages issus de `config.toml` : générique, blocs de paires et surcharges par paire.
+    /// Construit les paramétrages génériques, de groupes et de paires depuis la configuration.
+    ///
+    /// Entrée : configuration courante.
+    /// Sortie : paramétrages avec symboles de surcharge normalisés en majuscules.
     pub fn parametrages(&self) -> Parametrages {
         let mut generique = self.strategie.clone();
         generique.unite_temps = self.unites_temps.unite_execution.clone();
@@ -202,6 +226,9 @@ impl ConfigurationApplication {
 
 impl ConfigurationStrategie {
     /// Valide les valeurs ; `chemin` préfixe les messages (ex. `strategy`, `groups.alts.strategy`).
+    ///
+    /// Entrée : chemin de cette stratégie dans la configuration.
+    /// Sortie : `Ok(())` si les seuils et périodes sont valides, sinon erreur contextualisée.
     pub fn valider(&self, chemin: &str) -> Result<(), Box<dyn Error>> {
         if self.unite_temps.trim().is_empty() {
             return Err(format!("'{chemin}.timeframe' ne peut pas être vide").into());
@@ -276,7 +303,10 @@ pub struct Parametrages {
 }
 
 impl Parametrages {
-    /// Donne à chaque paire son propre réglage (copie de celui dont elle hérite) si elle n'en a pas.
+    /// Crée un réglage propre pour chaque symbole qui n'en possède pas déjà un.
+    ///
+    /// Entrée : symboles à compléter.
+    /// Sortie : met à jour les surcharges en copiant le réglage effectif hérité.
     pub fn completer(&mut self, symboles: &[String]) {
         for symbole in symboles {
             let cle = symbole.to_uppercase();
@@ -288,6 +318,9 @@ impl Parametrages {
     }
 
     /// Copie le réglage d'une portée vers les paires qu'elle couvre (toutes pour le générique).
+    ///
+    /// Entrées : portée source et liste des symboles; la portée groupe utilise ses propres membres.
+    /// Sortie : met à jour les réglages explicites des paires concernées.
     pub fn propager(&mut self, portee: &Portee, symboles: &[String]) {
         let source = self.lire(portee);
         let cibles: Vec<String> = match portee {
@@ -304,7 +337,10 @@ impl Parametrages {
         }
     }
 
-    /// Symboles regroupés par période, pour ouvrir un flux par période.
+    /// Regroupe les symboles par période effective, pour ouvrir un flux par période.
+    ///
+    /// Entrée : symboles à regrouper.
+    /// Sortie : table associant chaque unité de temps à ses symboles.
     pub fn par_unite(&self, symboles: &[String]) -> BTreeMap<String, Vec<String>> {
         let mut groupes: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for s in symboles {
@@ -316,7 +352,10 @@ impl Parametrages {
         groupes
     }
 
-    /// Paramétrage effectif d'une paire.
+    /// Résout le paramétrage effectif d'une paire selon la priorité paire > groupe > générique.
+    ///
+    /// Entrée : symbole de la paire.
+    /// Sortie : référence à la stratégie applicable.
     pub fn resoudre(&self, symbole: &str) -> &ConfigurationStrategie {
         let symbole = symbole.to_uppercase();
         if let Some(s) = self.paires.get(&symbole) {
@@ -329,7 +368,10 @@ impl Parametrages {
             .unwrap_or(&self.generique)
     }
 
-    /// Paramétrage affiché pour une portée (hérité si elle n'a pas de réglage propre).
+    /// Lit le paramétrage d'une portée, hérité du niveau générique si nécessaire.
+    ///
+    /// Entrée : portée à consulter.
+    /// Sortie : copie de la stratégie effective pour cette portée.
     pub fn lire(&self, portee: &Portee) -> ConfigurationStrategie {
         match portee {
             Portee::Generique => self.generique.clone(),
@@ -342,6 +384,10 @@ impl Parametrages {
         }
     }
 
+    /// Enregistre un réglage pour la portée générique, un groupe ou une paire.
+    ///
+    /// Entrées : portée ciblée et configuration stratégique à appliquer.
+    /// Sortie : met à jour les paramétrages; une portée de groupe inconnue reste inchangée.
     pub fn ecrire(&mut self, portee: &Portee, strategie: ConfigurationStrategie) {
         match portee {
             Portee::Generique => self.generique = strategie,
@@ -357,6 +403,9 @@ impl Parametrages {
     }
 
     /// Supprime le réglage propre d'une portée (le générique ne peut pas être supprimé).
+    ///
+    /// Entrée : portée à réinitialiser.
+    /// Sortie : retire la surcharge de paire ou de groupe si elle existe.
     pub fn reinitialiser(&mut self, portee: &Portee) {
         match portee {
             Portee::Generique => {}
@@ -371,6 +420,10 @@ impl Parametrages {
         }
     }
 
+    /// Indique si une portée possède un réglage explicite.
+    ///
+    /// Entrée : portée à vérifier.
+    /// Sortie : `true` si le réglage est défini directement (la portée générique l'est toujours).
     pub fn a_un_reglage_propre(&self, portee: &Portee) -> bool {
         match portee {
             Portee::Generique => true,
@@ -379,6 +432,9 @@ impl Parametrages {
         }
     }
 
+    /// Valide le réglage générique, tous les groupes et toutes les paires.
+    ///
+    /// Sortie : `Ok(())` si chaque stratégie est cohérente, sinon la première erreur rencontrée.
     pub fn valider(&self) -> Result<(), Box<dyn Error>> {
         self.generique.valider("strategy")?;
         for (nom, groupe) in &self.groupes {
@@ -392,7 +448,10 @@ impl Parametrages {
         Ok(())
     }
 
-    /// Charge une sauvegarde de paramétrages.
+    /// Charge et valide une sauvegarde de paramétrages au format TOML.
+    ///
+    /// Entrée : chemin du fichier.
+    /// Sortie : paramétrages valides avec les symboles normalisés, ou erreur de lecture/parsing/validation.
     pub fn charger(chemin: &Path) -> Result<Self, Box<dyn Error>> {
         let contenu = fs::read_to_string(chemin)?;
         let mut parametrages: Self = toml::from_str(&contenu).map_err(|erreur| {
@@ -410,6 +469,10 @@ impl Parametrages {
         Ok(parametrages)
     }
 
+    /// Valide puis écrit les paramétrages au format TOML sur disque.
+    ///
+    /// Entrée : chemin du fichier de sauvegarde.
+    /// Sortie : `Ok(())` si l'écriture réussit, sinon une erreur de validation, sérialisation ou I/O.
     pub fn sauvegarder(&self, chemin: &Path) -> Result<(), Box<dyn Error>> {
         self.valider()?;
         fs::write(chemin, toml::to_string_pretty(self)?)?;

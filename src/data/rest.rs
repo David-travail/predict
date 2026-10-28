@@ -17,6 +17,9 @@ static DERNIERE_REQUETE: Mutex<Option<Instant>> = Mutex::const_new(None);
 /// Télécharge jusqu'à `limite` bougies, éventuellement bornées par `debut_ms` / `fin_ms`
 /// (millisecondes Unix, bornes incluses). Sans `debut_ms`, Binance renvoie les plus récentes
 /// avant `fin_ms`.
+///
+/// Entrées : symbole, unité de temps, bornes optionnelles, limite et délai réseau minimal.
+/// Sortie : bougies converties ou erreur de paramètres, réseau ou réponse.
 pub async fn telecharger_bougies_periode(
     symbole: &str,
     unite_temps: &str,
@@ -55,6 +58,9 @@ pub async fn telecharger_bougies_periode(
 }
 
 /// Télécharge toutes les bougies de `[debut_ms, fin_ms]` en paginant par lots de 1000.
+///
+/// Entrées : symbole, unité de temps, bornes inclusives en millisecondes et délai réseau minimal.
+/// Sortie : bougies de la période ou erreur lors d'une requête/conversion.
 pub async fn telecharger_plage_bougies(
     symbole: &str,
     unite_temps: &str,
@@ -90,6 +96,9 @@ pub async fn telecharger_plage_bougies(
 
 /// Bloque jusqu'à ce que `delai_minimal` se soit écoulé depuis la requête précédente.
 /// Le verrou reste pris pendant l'attente pour sérialiser les appels concurrents.
+///
+/// Entrée : délai minimal facultatif.
+/// Sortie : reprend après le délai requis et mémorise l'instant de la requête suivante.
 async fn attendre_delai_minimal(delai_minimal: Option<Duration>) {
     let mut derniere = DERNIERE_REQUETE.lock().await;
 
@@ -107,6 +116,9 @@ async fn attendre_delai_minimal(delai_minimal: Option<Duration>) {
 ///
 /// Format d'une entrée : `[ouverture_ms, "open", "high", "low", "close", "volume",
 /// cloture_ms, ...]`. Une bougie est considérée close si son instant de clôture est passé.
+///
+/// Entrées : réponse JSON, symbole, unité de temps et heure de référence.
+/// Sortie : bougies converties ou erreur si la forme ou un champ est invalide.
 fn convertir_bougies(
     donnees: &Value,
     symbole: &str,
@@ -144,6 +156,9 @@ fn convertir_bougies(
 }
 
 /// Lit un nombre transmis sous forme de chaîne (ex. `"43250.01"`).
+///
+/// Entrées : valeur JSON et nom du champ pour contextualiser l'erreur.
+/// Sortie : nombre `f64` ou erreur de type/parsing.
 fn lire_decimal(valeur: &Value, nom: &str) -> Result<f64, Box<dyn Error>> {
     valeur
         .as_str()
@@ -153,6 +168,9 @@ fn lire_decimal(valeur: &Value, nom: &str) -> Result<f64, Box<dyn Error>> {
 }
 
 /// Lit un horodatage en millisecondes depuis l'époque Unix.
+///
+/// Entrées : valeur JSON et nom du champ.
+/// Sortie : date UTC ou erreur de type/limite.
 fn lire_instant(valeur: &Value, nom: &str) -> Result<DateTime<Utc>, Box<dyn Error>> {
     let millisecondes = valeur
         .as_i64()

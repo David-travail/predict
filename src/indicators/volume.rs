@@ -3,6 +3,9 @@
 /// Calcule la moyenne mobile simple (SMA) des `periode` dernières valeurs.
 ///
 /// Retourne `None` si `periode` vaut 0 ou si `valeurs` est trop courte.
+///
+/// Entrées : valeurs numériques et période de la moyenne.
+/// Sortie : moyenne des dernières valeurs, ou `None` si elles sont insuffisantes.
 pub fn calculer_sma(valeurs: &[f64], periode: usize) -> Option<f64> {
     if periode == 0 || valeurs.len() < periode {
         return None;
@@ -17,6 +20,9 @@ pub fn calculer_sma(valeurs: &[f64], periode: usize) -> Option<f64> {
 /// Retourne `(cassure, ratio)` où `ratio = volume_courant / SMA`.
 /// Sans SMA calculable : `(false, 0.0)`. Si la SMA est nulle, le ratio vaut
 /// `f64::INFINITY` pour un volume positif, sinon `0.0`.
+///
+/// Entrées : volume courant, historique des volumes, période SMA et multiplicateur seuil.
+/// Sortie : couple indiquant si le volume dépasse le seuil et son ratio à la SMA.
 pub fn valider_cassure_volume(
     volume_courant: f64,
     historique_volume: &[f64],

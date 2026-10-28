@@ -69,6 +69,9 @@ const UNITES_TEMPS: &[&str] = &[
 ];
 
 /// Prix à 2 décimales avec les milliers séparés par une espace (ex. `12 345.67`).
+///
+/// Entrée : prix numérique.
+/// Sortie : prix formaté avec deux décimales.
 fn formater_prix(prix: f64) -> String {
     let texte = format!("{prix:.2}");
     let (signe, reste) = texte
@@ -85,6 +88,10 @@ fn formater_prix(prix: f64) -> String {
     format!("{signe}{groupes}.{decimales}")
 }
 
+/// Ajoute un séparateur lisible entre une paire et sa devise de cotation connue.
+///
+/// Entrée : symbole sans séparateur.
+/// Sortie : paire formatée, ou symbole inchangé si aucune devise fiat ne correspond.
 fn formater_paire(symbole: &str) -> String {
     const DEVISES_FIAT: &[&str] = &[
         "AED", "ARS", "AUD", "BRL", "CAD", "CHF", "CLP", "CNY", "CZK", "DKK", "EUR", "GBP", "HKD",
@@ -103,6 +110,10 @@ fn formater_paire(symbole: &str) -> String {
         .unwrap_or_else(|| symbole.to_string())
 }
 
+/// Affiche un calendrier de sélection et met à jour la date choisie.
+///
+/// Entrées : contexte egui, titre/identifiant, état d'ouverture, mois affiché et valeur de date.
+/// Sortie : met à jour la date au format `AAAA-MM-JJ` et ferme le calendrier après sélection.
 fn afficher_calendrier(
     ctx: &egui::Context,
     titre: &str,
@@ -230,6 +241,10 @@ pub struct ApplicationCryptobot {
 }
 
 impl ApplicationCryptobot {
+    /// Construit l'IHM avec les symboles, fournisseurs et paramétrages initiaux.
+    ///
+    /// Entrées : récepteur de signaux, paramétrages, fournisseurs et symboles suivis.
+    /// Sortie : application initialisée avec le mode temps réel sélectionné.
     pub fn new(
         rx_mpsc: Receiver<SignalVisuel>,
         parametrages: Parametrages,
@@ -278,6 +293,9 @@ impl ApplicationCryptobot {
     }
 
     /// Branche l'IHM sur le moteur : envoi des commandes et réception des messages d'état.
+    ///
+    /// Entrées : canal d'envoi des commandes et récepteur des notifications du moteur.
+    /// Sortie : application configurée, renvoyée pour chaînage.
     pub fn avec_moteur(
         mut self,
         tx_commandes: UnboundedSender<CommandeMoteur>,
@@ -288,6 +306,11 @@ impl ApplicationCryptobot {
         self
     }
 
+    /// Initialise l'IHM depuis l'état reçu à la connexion au moteur.
+    ///
+    /// Entrées : génération et mode actifs, signaux initiaux et notification de statut éventuelle.
+    /// Sortie : application mise à jour, renvoyée pour chaînage; les éléments d'autres générations
+    /// sont ignorés.
     pub fn avec_etat_initial(
         mut self,
         generation: u64,
@@ -316,6 +339,9 @@ impl ApplicationCryptobot {
     }
 
     /// Efface toutes les valeurs affichées et invalide les signaux encore en transit.
+    ///
+    /// Entrée : état courant de l'application.
+    /// Sortie : incrémente la génération et vide les données d'affichage.
     fn reinitialiser(&mut self) {
         self.generation += 1;
         self.paires.clear();
@@ -327,6 +353,10 @@ impl ApplicationCryptobot {
         while self.rx_mpsc.try_recv().is_ok() {}
     }
 
+    /// Envoie une commande au moteur si le canal est connecté.
+    ///
+    /// Entrée : commande moteur.
+    /// Sortie : transmet la commande ou affiche un statut si le moteur n'est plus connecté.
     fn envoyer(&mut self, commande: CommandeMoteur) {
         if let Some(tx) = &self.tx_commandes {
             if tx.send(commande).is_err() {
@@ -337,6 +367,9 @@ impl ApplicationCryptobot {
 
     /// Change de mode : tout est réinitialisé ; temps réel et simulation démarrent aussitôt,
     /// les modes de test attendent le clic sur « Charger & Lancer ».
+    ///
+    /// Entrée : mode sélectionné dans l'IHM.
+    /// Sortie : réinitialise les valeurs et démarre le mode ou demande l'arrêt du moteur.
     fn changer_de_mode(&mut self) {
         self.reinitialiser();
         match self.mode_actif {
@@ -352,6 +385,10 @@ impl ApplicationCryptobot {
         }
     }
 
+    /// Envoie au moteur une commande de démarrage avec la sélection et les réglages actuels.
+    ///
+    /// Entrée : état courant de l'IHM.
+    /// Sortie : transmet une commande de démarrage via le canal configuré.
     fn lancer(&mut self) {
         self.envoyer(CommandeMoteur::Demarrer {
             generation: self.generation,
@@ -372,6 +409,9 @@ impl ApplicationCryptobot {
 }
 
 /// Champs d'édition des indicateurs d'un paramétrage (utilisés par la barre et par chaque carte).
+///
+/// Entrées : interface egui, stratégie modifiable et choix de disposition.
+/// Sortie : affiche les contrôles et met à jour directement la stratégie.
 fn editeur_indicateurs(
     ui: &mut egui::Ui,
     s: &mut ConfigurationStrategie,
@@ -522,6 +562,10 @@ fn editeur_indicateurs(
 }
 
 impl eframe::App for ApplicationCryptobot {
+    /// Dessine l'interface et traite les signaux, statuts et interactions utilisateur.
+    ///
+    /// Entrées : interface egui et frame courant.
+    /// Sortie : met à jour l'état de l'application et dessine la frame; ne retourne pas de valeur.
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
 

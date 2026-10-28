@@ -12,6 +12,10 @@ pub enum Fournisseur {
 }
 
 impl Fournisseur {
+    /// Retourne le nom lisible du fournisseur.
+    ///
+    /// Entrée : fournisseur courant.
+    /// Sortie : libellé statique (`Binance`, `Kraken` ou `Coinbase`).
     pub fn libelle(self) -> &'static str {
         match self {
             Self::Binance => "Binance",
@@ -43,6 +47,10 @@ struct GroupeBougies {
 }
 
 impl Agregateur {
+    /// Crée un agrégateur pour les fournisseurs attendus et le délai de regroupement.
+    ///
+    /// Entrées : liste des fournisseurs à agréger et délai maximal d'attente.
+    /// Sortie : agrégateur vide prêt à recevoir des bougies.
     pub fn nouveau(fournisseurs: &[Fournisseur], delai_attente: Duration) -> Self {
         Self {
             fournisseurs_attendus: fournisseurs.iter().copied().collect(),
@@ -51,6 +59,10 @@ impl Agregateur {
         }
     }
 
+    /// Ajoute une mise à jour source et agrège les bougies correspondantes si possible.
+    ///
+    /// Entrée : bougie identifiée par son fournisseur.
+    /// Sortie : bougie agrégée lorsqu'assez de sources sont disponibles, sinon `None`.
     pub fn recevoir(&mut self, bougie_sourcee: BougieSourcee) -> Option<Bougie> {
         if !self
             .fournisseurs_attendus
@@ -107,6 +119,9 @@ impl Agregateur {
         resultat
     }
 
+    /// Émet les groupes de bougies dont le délai d'attente est écoulé.
+    ///
+    /// Sortie : bougies agrégées nouvellement disponibles.
     pub fn emettre_expirees(&mut self) -> Vec<Bougie> {
         let sources_minimales = self.fournisseurs_attendus.len().min(2);
         let mut resultats = Vec::new();
@@ -126,6 +141,9 @@ impl Agregateur {
         resultats
     }
 
+    /// Supprime les groupes anciens du même symbole et de la même unité de temps.
+    ///
+    /// Entrée : clé de la bougie courante, utilisée pour calculer la fenêtre conservée.
     fn nettoyer(&mut self, cle_courante: &(String, String, i64)) {
         let Some(duree) = duree_unite(&cle_courante.1) else {
             return;
@@ -137,6 +155,10 @@ impl Agregateur {
     }
 }
 
+/// Agrège les bougies historiques clôturées par symbole, unité de temps et ouverture.
+///
+/// Entrées : bougies étiquetées par fournisseur et liste des fournisseurs attendus.
+/// Sortie : bougies agrégées disposant du nombre minimal de sources.
 pub fn agreger_historique(
     bougies: Vec<BougieSourcee>,
     fournisseurs: &[Fournisseur],
@@ -169,6 +191,10 @@ pub fn agreger_historique(
         .collect()
 }
 
+/// Calcule une bougie agrégée à partir des bougies fournies.
+///
+/// Entrée : bougies indexées par fournisseur pour une même période.
+/// Sortie : moyenne OHLC et volume cumulé, ou `None` si l'entrée est vide.
 fn agreger(bougies: &HashMap<Fournisseur, Bougie>) -> Option<Bougie> {
     if bougies.is_empty() {
         return None;
@@ -190,6 +216,10 @@ fn agreger(bougies: &HashMap<Fournisseur, Bougie>) -> Option<Bougie> {
     })
 }
 
+/// Convertit une unité de temps positive (`1m`, `4h`, `1d`, etc.) en durée.
+///
+/// Entrée : unité composée d'un entier et d'un suffixe reconnu.
+/// Sortie : durée correspondante, ou `None` si le format ou le suffixe est invalide.
 pub fn duree_unite(unite: &str) -> Option<chrono::Duration> {
     let (nombre, suffixe) = unite.split_at(unite.len().checked_sub(1)?);
     let nombre: i64 = nombre.parse().ok()?;

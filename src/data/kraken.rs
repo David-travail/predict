@@ -1,3 +1,18 @@
+//! Flux Kraken : historique REST et bougies temps reel via WebSocket.
+//!
+//! Historique : `main` appelle `telecharger_historique(symbole, unite_temps,
+//! limite, delai_minimal)`. La fonction convertit la paire et l'intervalle,
+//! interroge l'API REST, puis convertit et trie les lignes avec
+//! `convertir_ligne_rest`. Elle retourne `Result<Vec<Bougie>, erreur>`.
+//!
+//! Temps reel : `main` appelle `ecouter_flux_temps_reel(symboles, unite_temps,
+//! tx)` avec un canal `Sender<BougieSourcee>`. La fonction convertit les paires
+//! et l'intervalle, puis relance `connecter_et_lire` apres les erreurs.
+//! `connecter_et_lire` s'abonne au canal OHLC, passe les messages a
+//! `analyser_messages`, suit la bougie courante par symbole et envoie les
+//! bougies sur `tx`. Les convertisseurs de paire et de valeur alimentent ces
+//! traitements. Sortie : mises a jour `BougieSourcee` (fournisseur Kraken).
+
 use crate::core::modeles::Bougie;
 use crate::data::sources::{BougieSourcee, Fournisseur, duree_unite};
 use chrono::{DateTime, Utc};
@@ -15,6 +30,11 @@ const URL_REST: &str = "https://api.kraken.com/0/public/OHLC";
 const URL_WEBSOCKET: &str = "wss://ws.kraken.com/v2";
 const HOTE_WEBSOCKET: &str = "ws.kraken.com:443";
 
+/// Télécharge et convertit l'historique de bougies Kraken pour une paire.
+///
+/// Entrées : symbole, unité de temps, nombre maximal de bougies et délai minimal
+/// à respecter après la requête.
+/// Sortie : bougies triées par ouverture, ou erreur de conversion/réseau.
 pub async fn telecharger_historique(
     symbole: &str,
     unite_temps: &str,
@@ -61,6 +81,11 @@ pub async fn telecharger_historique(
     Ok(bougies)
 }
 
+/// Écoute le flux OHLC Kraken et transmet les mises à jour des bougies.
+///
+/// Entrées : symboles, unité de temps et canal recevant les `BougieSourcee`.
+/// Sortie : la fonction tourne jusqu'à la fermeture du canal; les erreurs de
+/// connexion entraînent une reconnexion avec délai exponentiel.
 pub async fn ecouter_flux_temps_reel(
     symboles: &[String],
     unite_temps: &str,
@@ -101,6 +126,11 @@ pub async fn ecouter_flux_temps_reel(
     }
 }
 
+/// Ouvre le WebSocket Kraken, s'abonne aux paires et transmet les bougies reçues.
+///
+/// Entrées : paires Kraken, intervalle en minutes, unité interne et canal de sortie.
+/// Sortie : `Ok(())` si le récepteur est fermé; une erreur si la connexion ou
+/// la lecture échoue.
 async fn connecter_et_lire(
     paires: &[String],
     intervalle: u32,
@@ -176,6 +206,11 @@ async fn connecter_et_lire(
     }
 }
 
+/// Analyse un message OHLC Kraken et convertit toutes ses données en bougies.
+///
+/// Entrées : message JSON et unité de temps interne.
+/// Sortie : liste de couples symbole/bougie (vide pour les messages ignorés),
+/// ou erreur si le message est refusé ou invalide.
 fn analyser_messages(
     texte: &str,
     unite_temps: &str,
@@ -222,6 +257,11 @@ fn analyser_messages(
         .collect()
 }
 
+/// Convertit une ligne OHLC REST Kraken en bougie interne.
+///
+/// Entrées : ligne JSON, symbole, unité de temps et heure courante pour calculer
+/// l'état de clôture.
+/// Sortie : bougie convertie ou erreur si une donnée est invalide.
 fn convertir_ligne_rest(
     ligne: &Value,
     symbole: &str,
@@ -252,6 +292,10 @@ fn convertir_ligne_rest(
     })
 }
 
+/// Convertit une unité de temps en intervalle REST/WebSocket Kraken, en minutes.
+///
+/// Entrée : unité telle que `1m`, `1h` ou `1d`.
+/// Sortie : nombre de minutes ou erreur si l'unité n'est pas prise en charge.
 fn intervalle_minutes(unite: &str) -> Result<u32, Box<dyn Error>> {
     let minutes = match unite {
         "1m" => 1,
@@ -267,6 +311,10 @@ fn intervalle_minutes(unite: &str) -> Result<u32, Box<dyn Error>> {
     Ok(minutes)
 }
 
+/// Convertit un symbole interne au format de paire utilisé par l'API REST Kraken.
+///
+/// Entrée : symbole interne, par exemple `BTCEUR`.
+/// Sortie : paire Kraken (avec `BTC` converti en `XBT`) ou `None` si invalide.
 fn paire_kraken(symbole: &str) -> Option<String> {
     let (base, quote) = decouper_symbole(symbole)?;
     let base = if base == "BTC" {
@@ -277,17 +325,29 @@ fn paire_kraken(symbole: &str) -> Option<String> {
     Some(format!("{base}{quote}"))
 }
 
+/// Convertit un symbole interne au format `BASE/QUOTE` du WebSocket Kraken.
+///
+/// Entrée : symbole interne, par exemple `BTCEUR`.
+/// Sortie : paire WebSocket ou `None` si le symbole ne peut pas être découpé.
 fn paire_websocket(symbole: &str) -> Option<String> {
     let (base, quote) = decouper_symbole(symbole)?;
     Some(format!("{base}/{quote}"))
 }
 
+/// Convertit une paire Kraken `BASE/QUOTE` en symbole interne sans séparateur.
+///
+/// Entrée : paire reçue du WebSocket.
+/// Sortie : symbole interne (avec `XBT` normalisé en `BTC`) ou `None` si invalide.
 fn paire_interne(paire: &str) -> Option<String> {
     let (base, quote) = paire.split_once('/')?;
     let base = if base == "XBT" { "BTC" } else { base };
     Some(format!("{base}{quote}"))
 }
 
+/// Sépare un symbole interne en devise de base et devise de cotation.
+///
+/// Entrée : symbole, normalisé en majuscules après suppression des espaces.
+/// Sortie : couple `(base, cotation)` ou `None` si aucune cotation connue ne correspond.
 pub fn decouper_symbole(symbole: &str) -> Option<(String, String)> {
     let symbole = symbole.trim().to_uppercase();
     for quote in ["USDT", "USDC", "EUR", "USD", "GBP", "BTC"] {
@@ -300,6 +360,10 @@ pub fn decouper_symbole(symbole: &str) -> Option<(String, String)> {
     None
 }
 
+/// Lit un champ texte obligatoire dans un objet JSON Kraken.
+///
+/// Entrées : objet JSON et nom du champ.
+/// Sortie : référence au texte du champ ou erreur s'il est absent ou invalide.
 fn lire_texte<'a>(valeur: &'a Value, cle: &str) -> Result<&'a str, Box<dyn Error>> {
     valeur
         .get(cle)
@@ -307,12 +371,20 @@ fn lire_texte<'a>(valeur: &'a Value, cle: &str) -> Result<&'a str, Box<dyn Error
         .ok_or_else(|| format!("Champ Kraken '{cle}' absent ou invalide").into())
 }
 
+/// Lit et convertit un champ décimal textuel d'un message WebSocket Kraken.
+///
+/// Entrées : objet JSON et nom du champ.
+/// Sortie : valeur `f64` ou erreur si le champ est absent ou invalide.
 fn decimal(valeur: &Value, cle: &str) -> Result<f64, Box<dyn Error>> {
     lire_texte(valeur, cle)?
         .parse()
         .map_err(|erreur| format!("Champ Kraken '{cle}' invalide : {erreur}").into())
 }
 
+/// Convertit une valeur décimale REST Kraken représentée sous forme de texte.
+///
+/// Entrée : valeur JSON à convertir.
+/// Sortie : valeur `f64` ou erreur si elle n'est pas textuelle ou numérique.
 fn decimal_valeur(valeur: &Value) -> Result<f64, Box<dyn Error>> {
     valeur
         .as_str()

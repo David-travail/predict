@@ -10,6 +10,9 @@ use crate::core::modeles::Bougie;
 /// l'ADX, qui est ensuite lissé à chaque nouvelle bougie.
 ///
 /// Retourne `None` si `periode` vaut 0 ou s'il y a moins de `2 * periode` bougies.
+///
+/// Entrées : bougies chronologiques et période de lissage.
+/// Sortie : dernière valeur ADX disponible, ou `None` si l'historique ne suffit pas.
 pub fn calculer_adx(bougies: &[Bougie], periode: usize) -> Option<f64> {
     let bougies_requises = periode.checked_mul(2)?;
     if periode == 0 || bougies.len() < bougies_requises {

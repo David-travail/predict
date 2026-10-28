@@ -2,6 +2,10 @@ use crate::core::modeles::Bougie;
 
 /// Calcule le Supertrend (ATR de Wilder) et retourne `true` si la dernière bougie est en tendance haussière.
 /// Retourne `None` s'il y a moins de `periode + 1` bougies.
+///
+/// Entrées : bougies chronologiques, période ATR et multiplicateur.
+/// Sortie : `Some(true)` pour une tendance haussière, `Some(false)` pour une tendance baissière,
+/// ou `None` si la période/l'historique ne permet pas le calcul.
 pub fn supertrend_haussier(
     bougies: &[Bougie],
     periode: usize,

@@ -1,4 +1,15 @@
-﻿//! Flux temps réel Binance (WebSocket) avec reconnexion automatique.
+//! Flux temps reel Binance (WebSocket).
+//!
+//! `main` appelle `ecouter_flux_temps_reel(symboles, ut_execution, tx)` avec les
+//! symboles et l'unite de temps a suivre, et un canal `Sender<Bougie>`.
+//! `ecouter_flux_temps_reel` construit l'URL via `construire_url`, puis appelle
+//! `connecter_et_lire`; en cas de coupure, il relance la connexion avec un delai
+//! exponentiel. `connecter_et_lire` lit les messages, les passe a `analyser_message`,
+//! puis envoie chaque bougie (en cours ou cloturee) dans `tx`.
+//! `analyser_message` extrait les champs Kline et `lire_texte`,
+//! `lire_decimal` et `lire_instant` convertissent leurs valeurs.
+//! Sortie : mises a jour `Bougie` sur le canal; l'ecoute s'arrete lorsque le
+//! recepteur est ferme.
 
 use crate::core::modeles::Bougie;
 use chrono::{DateTime, TimeZone, Utc};
@@ -18,7 +29,7 @@ const DELAI_RECONNEXION_MAX: Duration = Duration::from_secs(60);
 /// Binance envoie un ping toutes les 20 s : sans aucun message pendant ce laps de temps, la connexion est considérée morte.
 const DELAI_INACTIVITE_MAX: Duration = Duration::from_secs(60);
 
-/// Écoute en continu les bougies fermées des `symboles` sur l'unité de temps `ut_execution`
+/// Écoute en continu les bougies des `symboles` sur l'unité de temps `ut_execution`
 /// et les transmet à `tx`.
 ///
 /// La fonction ne rend la main que si la liste de symboles est vide ou si le récepteur du
@@ -56,7 +67,10 @@ pub async fn ecouter_flux_temps_reel(
     }
 }
 
-/// Construit l'URL du flux combiné, ex. `.../stream?streams=btceur@kline_1h/ethusdt@kline_1h`.
+/// Construit l'URL Binance combinée à partir des symboles et de l'unité de temps.
+///
+/// Entrées : les symboles internes et l'unité de temps Binance.
+/// Sortie : l'URL WebSocket avec un flux Kline par symbole.
 fn construire_url(symboles: &[String], ut_execution: &str) -> String {
     let flux: Vec<String> = symboles
         .iter()
@@ -66,8 +80,11 @@ fn construire_url(symboles: &[String], ut_execution: &str) -> String {
     format!("{URL_BASE}{}", flux.join("/"))
 }
 
-/// Maintient une connexion jusqu'à erreur. `Ok(())` signifie que `tx` est fermé.
-/// Remet `delai` à sa valeur initiale dès que la connexion est établie.
+/// Se connecte au flux Binance, lit les messages et transmet les bougies à `tx`.
+///
+/// Entrées : URL du flux, canal de sortie et délai courant de reconnexion.
+/// Sortie : `Ok(())` si le récepteur est fermé; une erreur si la connexion ou la
+/// lecture échoue. Le délai est réinitialisé après une connexion réussie.
 async fn connecter_et_lire(
     url: &str,
     tx: &Sender<Bougie>,
@@ -139,18 +156,30 @@ fn analyser_message(texte: &str) -> Result<Option<Bougie>, Box<dyn Error>> {
     }))
 }
 
+/// Lit un champ texte obligatoire d'un objet Kline Binance.
+///
+/// Entrées : objet JSON Kline et nom du champ.
+/// Sortie : référence au texte du champ ou erreur s'il est absent ou invalide.
 fn lire_texte<'a>(k: &'a Value, cle: &str) -> Result<&'a str, Box<dyn Error>> {
     k.get(cle)
         .and_then(Value::as_str)
         .ok_or_else(|| format!("champ '{cle}' absent ou invalide").into())
 }
 
+/// Lit et convertit un champ décimal Binance depuis sa représentation textuelle.
+///
+/// Entrées : objet JSON Kline et nom du champ.
+/// Sortie : valeur `f64` ou erreur si le champ n'est pas un nombre valide.
 fn lire_decimal(k: &Value, cle: &str) -> Result<f64, Box<dyn Error>> {
     lire_texte(k, cle)?
         .parse::<f64>()
         .map_err(|erreur| format!("champ '{cle}' invalide : {erreur}").into())
 }
 
+/// Convertit un horodatage Kline Binance en millisecondes en date UTC.
+///
+/// Entrées : objet JSON Kline et nom du champ d'horodatage.
+/// Sortie : date UTC ou erreur si l'horodatage est absent ou hors limites.
 fn lire_instant(k: &Value, cle: &str) -> Result<DateTime<Utc>, Box<dyn Error>> {
     let millisecondes = k
         .get(cle)

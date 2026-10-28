@@ -14,11 +14,16 @@ use tokio_tungstenite::{
 static PROXY_CONFIGURE: OnceLock<Option<String>> = OnceLock::new();
 
 /// Fixe le proxy issu de la configuration (`network.proxy`). Sans effet après le premier appel.
+///
+/// Entrée : proxy optionnel; une chaîne vide est traitée comme une absence de proxy.
+/// Sortie : enregistre la valeur une seule fois.
 pub fn definir_proxy(proxy: Option<String>) {
     let _ = PROXY_CONFIGURE.set(proxy.filter(|p| !p.trim().is_empty()));
 }
 
 /// Proxy à utiliser : configuration d'abord, sinon variables d'environnement usuelles.
+///
+/// Sortie : URL de proxy configurée ou trouvée dans l'environnement, sinon `None`.
 pub fn proxy() -> Option<String> {
     PROXY_CONFIGURE.get().cloned().flatten().or_else(|| {
         [
@@ -36,6 +41,9 @@ pub fn proxy() -> Option<String> {
 }
 
 /// Extrait `hote:port` d'une URL de proxy (`http://127.0.0.1:9000`).
+///
+/// Entrée : adresse de proxy éventuellement préfixée par un schéma.
+/// Sortie : adresse `hote:port` (port 80 si absent).
 pub fn adresse_proxy(proxy: &str) -> String {
     let sans_schema = proxy.split_once("://").map_or(proxy, |(_, reste)| reste);
     let sans_chemin = sans_schema.trim_end_matches('/');
@@ -47,6 +55,8 @@ pub fn adresse_proxy(proxy: &str) -> String {
 }
 
 /// Client HTTP configuré avec le proxy éventuel.
+///
+/// Sortie : client avec délai de 30 secondes et proxy courant, ou erreur de configuration.
 pub fn client_http() -> Result<reqwest::Client, reqwest::Error> {
     let mut constructeur = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30));
     if let Some(proxy) = proxy() {
@@ -55,6 +65,10 @@ pub fn client_http() -> Result<reqwest::Client, reqwest::Error> {
     constructeur.build()
 }
 
+/// Ouvre une connexion WebSocket directe ou via le proxy configuré.
+///
+/// Entrées : URL cible et hôte/port auquel établir le tunnel HTTP CONNECT.
+/// Sortie : flux WebSocket et réponse de handshake, ou erreur de connexion/proxy.
 pub async fn ouvrir_websocket(
     url: &str,
     hote: &str,

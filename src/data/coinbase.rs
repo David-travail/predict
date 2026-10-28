@@ -1,3 +1,20 @@
+//! Flux Coinbase : historique REST et bougies temps reel construites depuis
+//! les transactions WebSocket.
+//!
+//! Historique : `main` appelle `telecharger_historique(symbole, unite_temps,
+//! limite, delai_minimal)`. La fonction convertit le symbole et la granularite,
+//! interroge l'API REST, puis transforme les lignes avec `convertir_ligne`.
+//! Elle retourne `Result<Vec<Bougie>, erreur>`.
+//!
+//! Temps reel : `main` appelle `ecouter_flux_temps_reel(symboles, unite_temps,
+//! tx)` avec un canal `Sender<BougieSourcee>`. La fonction convertit les
+//! symboles en produits Coinbase, puis relance `connecter_et_lire` apres les
+//! erreurs. Cette derniere s'abonne aux transactions `matches`; `analyser_match`
+//! les convertit en bougies, et `fusionner_trade` met a jour les transactions
+//! d'une meme periode. Les bougies sont envoyees sur `tx`; une nouvelle periode
+//! clot la precedente. Sortie : mises a jour `BougieSourcee` (fournisseur
+//! Coinbase).
+
 use crate::core::modeles::Bougie;
 use crate::data::sources::{BougieSourcee, Fournisseur, duree_unite};
 use chrono::{DateTime, TimeZone, Utc};
@@ -15,6 +32,11 @@ const URL_REST: &str = "https://api.exchange.coinbase.com";
 const URL_WEBSOCKET: &str = "wss://ws-feed.exchange.coinbase.com";
 const HOTE_WEBSOCKET: &str = "ws-feed.exchange.coinbase.com:443";
 
+/// Télécharge et convertit l'historique de bougies Coinbase pour une paire.
+///
+/// Entrées : symbole, unité de temps, nombre maximal de bougies et délai minimal
+/// à respecter après la requête.
+/// Sortie : bougies triées par ouverture, ou erreur de conversion/réseau.
 pub async fn telecharger_historique(
     symbole: &str,
     unite_temps: &str,
@@ -57,6 +79,11 @@ pub async fn telecharger_historique(
     Ok(bougies)
 }
 
+/// Écoute les transactions Coinbase et les agrège en bougies par période.
+///
+/// Entrées : symboles, unité de temps et canal recevant les `BougieSourcee`.
+/// Sortie : la fonction tourne jusqu'à la fermeture du canal; les erreurs de
+/// connexion entraînent une reconnexion avec délai exponentiel.
 pub async fn ecouter_flux_temps_reel(
     symboles: &[String],
     unite_temps: &str,
@@ -91,6 +118,12 @@ pub async fn ecouter_flux_temps_reel(
     }
 }
 
+/// Ouvre le WebSocket Coinbase, s'abonne aux transactions et construit les bougies.
+///
+/// Entrées : produits associés à leurs symboles internes, unité de temps et
+/// canal de sortie.
+/// Sortie : `Ok(())` si le récepteur est fermé; une erreur si la connexion ou
+/// la lecture échoue.
 async fn connecter_et_lire(
     produits: &[(String, String)],
     unite_temps: &str,
@@ -169,6 +202,11 @@ async fn connecter_et_lire(
     }
 }
 
+/// Analyse un message Coinbase et convertit une transaction en bougie ouverte.
+///
+/// Entrées : message JSON, unité de temps et correspondance produit/symbole.
+/// Sortie : symbole et bougie pour une transaction suivie, `None` pour les
+/// autres messages/produits, ou erreur si le message est invalide.
 fn analyser_match(
     texte: &str,
     unite_temps: &str,
@@ -227,6 +265,11 @@ fn analyser_match(
     )))
 }
 
+/// Fusionne une transaction avec la bougie de sa période.
+///
+/// Entrées : bougie accumulée et bougie issue de la nouvelle transaction.
+/// Sortie : bougie mise à jour avec extrêmes recalculés, dernière clôture et
+/// volumes additionnés.
 fn fusionner_trade(precedente: &Bougie, nouvelle: &Bougie) -> Bougie {
     Bougie {
         haut: precedente.haut.max(nouvelle.haut),
@@ -237,6 +280,11 @@ fn fusionner_trade(precedente: &Bougie, nouvelle: &Bougie) -> Bougie {
     }
 }
 
+/// Convertit une ligne de l'API REST Coinbase en bougie interne.
+///
+/// Entrées : ligne JSON, symbole, unité de temps, durée de la période et heure
+/// courante utilisée pour déterminer si la bougie est clôturée.
+/// Sortie : bougie convertie ou erreur si un champ est invalide.
 fn convertir_ligne(
     ligne: &Value,
     symbole: &str,
@@ -266,6 +314,10 @@ fn convertir_ligne(
     })
 }
 
+/// Convertit une unité de temps prise en charge en granularité REST, en secondes.
+///
+/// Entrée : unité telle que `1m` ou `1h`.
+/// Sortie : nombre de secondes ou erreur si Coinbase REST ne la prend pas en charge.
 fn granularite_secondes(unite: &str) -> Result<u32, Box<dyn Error>> {
     match unite {
         "1m" => Ok(60),
@@ -278,11 +330,19 @@ fn granularite_secondes(unite: &str) -> Result<u32, Box<dyn Error>> {
     }
 }
 
+/// Convertit un symbole interne en identifiant de produit Coinbase (`BASE-QUOTE`).
+///
+/// Entrée : symbole interne, par exemple `BTCEUR`.
+/// Sortie : identifiant Coinbase ou `None` si le symbole ne peut pas être découpé.
 fn produit_coinbase(symbole: &str) -> Option<String> {
     let (base, quote) = super::kraken::decouper_symbole(symbole)?;
     Some(format!("{base}-{quote}"))
 }
 
+/// Lit un champ décimal textuel dans un message Coinbase.
+///
+/// Entrées : objet JSON et nom du champ.
+/// Sortie : valeur `f64` ou erreur si le champ est absent ou invalide.
 fn decimal(message: &Value, cle: &str) -> Result<f64, Box<dyn Error>> {
     message
         .get(cle)
@@ -292,6 +352,10 @@ fn decimal(message: &Value, cle: &str) -> Result<f64, Box<dyn Error>> {
         .map_err(|erreur| format!("Champ Coinbase '{cle}' invalide : {erreur}").into())
 }
 
+/// Convertit une valeur REST Coinbase numérique ou textuelle en `f64`.
+///
+/// Entrée : valeur JSON à convertir.
+/// Sortie : valeur `f64` ou erreur si son format n'est pas numérique.
 fn decimal_valeur(valeur: &Value) -> Result<f64, Box<dyn Error>> {
     valeur
         .as_f64()

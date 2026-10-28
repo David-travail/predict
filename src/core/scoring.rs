@@ -1,5 +1,9 @@
 use crate::core::modeles::{AnalyseTechnique, Tendance};
 
+/// Calcule le score technique et indique s'il atteint le seuil d'alerte.
+///
+/// Entrées : analyse technique et score minimal d'alerte (0 à 100).
+/// Sortie : couple `(score, alerte)`; une tendance neutre donne un score nul.
 pub fn calculer_score(analyse: &AnalyseTechnique, seuil_alerte_minimal: u8) -> (u8, bool) {
     let score = if analyse.tendance != Tendance::Neutre {
         40 + if analyse.adx_valide { 30 } else { 0 } + if analyse.volume_valide { 30 } else { 0 }

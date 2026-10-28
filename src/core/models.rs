@@ -23,6 +23,10 @@ pub enum Tendance {
 }
 
 impl Tendance {
+    /// Retourne le libellé affiché pour cette tendance.
+    ///
+    /// Entrée : tendance courante.
+    /// Sortie : libellé statique avec son indicateur visuel.
     pub fn libelle(self) -> &'static str {
         match self {
             Tendance::Haussiere => "HAUSSE 📈",

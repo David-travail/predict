@@ -85,7 +85,9 @@ struct Arguments {
     config: Option<PathBuf>,
 }
 
-/// Chaque dossier candidat : courant, dossier de l'exe puis ses parents (utile depuis `target\debug`).
+/// Recherche `config.toml` dans le dossier courant, celui de l'exécutable et leurs parents.
+///
+/// Sortie : premier chemin existant, ou `None` si aucun fichier n'est trouvé.
 fn chercher_config() -> Option<PathBuf> {
     let mut dossiers = vec![std::env::current_dir().ok()?];
     if let Ok(exe) = std::env::current_exe() {
@@ -97,6 +99,10 @@ fn chercher_config() -> Option<PathBuf> {
         .find(|c| c.is_file())
 }
 
+/// Charge la configuration explicitement demandée, découverte sur disque ou intégrée.
+///
+/// Entrée : chemin optionnel fourni en ligne de commande.
+/// Sortie : configuration validée ou erreur de lecture, de parsing ou de validation.
 fn charger_configuration(
     demandee: Option<&PathBuf>,
 ) -> Result<ConfigurationApplication, Box<dyn std::error::Error>> {
@@ -112,7 +118,10 @@ fn charger_configuration(
     }
 }
 
-/// Fichier de sauvegarde des paramétrages, à côté du fichier de configuration.
+/// Détermine le chemin du fichier de sauvegarde des paramétrages.
+///
+/// Entrée : chemin optionnel de la configuration.
+/// Sortie : chemin `parametres.toml` placé à côté de la configuration, ou dans le dossier courant.
 fn chemin_parametrages(demandee: Option<&PathBuf>) -> PathBuf {
     demandee
         .cloned()
@@ -121,7 +130,10 @@ fn chemin_parametrages(demandee: Option<&PathBuf>) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("parametres.toml"))
 }
 
-/// Paramétrages de config.toml, remplacés par la sauvegarde si elle existe et est valide.
+/// Charge les paramétrages sauvegardés ou utilise ceux de la configuration principale.
+///
+/// Entrées : configuration validée et chemin de sauvegarde.
+/// Sortie : paramétrages avec un réglage explicite complété pour chaque symbole configuré.
 fn charger_parametrages(
     config: &ConfigurationApplication,
     chemin: &std::path::Path,
@@ -146,6 +158,9 @@ fn charger_parametrages(
 
 /// Rattache le processus à la console du terminal qui l'a lancé, pour que `println!`, les logs
 /// et `--help` s'affichent malgré le sous-système « windows ».
+///
+/// Entrée : aucune.
+/// Sortie : rattache les flux de sortie du processus à la console parente si disponible.
 #[cfg(windows)]
 fn rattacher_console() {
     use std::os::windows::io::AsRawHandle;
@@ -185,8 +200,16 @@ fn rattacher_console() {
 }
 
 #[cfg(not(windows))]
+/// Point d'entrée sans effet sur les plateformes autres que Windows.
+///
+/// Entrée : aucune.
+/// Sortie : aucune.
 fn rattacher_console() {}
 
+/// Démarre l'application et affiche les erreurs fatales selon le mode de lancement.
+///
+/// Entrée : arguments du processus lus depuis l'environnement.
+/// Sortie : aucune; quitte avec un code non nul si l'initialisation échoue.
 fn main() {
     let avec_arguments = std::env::args_os().len() > 1;
     // Sans argument (double-clic) : interface graphique sans console.
@@ -207,6 +230,10 @@ fn main() {
     }
 }
 
+/// Initialise les journaux, charge la configuration et lance le mode demandé.
+///
+/// Entrée : indique si le processus a été lancé avec des arguments.
+/// Sortie : `Ok(())` à l'arrêt normal ou erreur de configuration, réseau, IHM ou runtime.
 fn executer(_avec_arguments: bool) -> Result<(), Box<dyn std::error::Error>> {
     let arguments = Arguments::parse();
 
@@ -386,6 +413,10 @@ fn executer(_avec_arguments: bool) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Lit et valide le jeton partagé entre l'IHM et le moteur.
+///
+/// Entrée : variable d'environnement `PREDICT_TOKEN`.
+/// Sortie : jeton d'au moins 16 caractères ou erreur explicite.
 fn charger_jeton() -> Result<String, Box<dyn std::error::Error>> {
     let jeton = std::env::var("PREDICT_TOKEN").map_err(
         |_| "Définissez la variable d'environnement PREDICT_TOKEN sur le moteur et l'IHM",
@@ -396,6 +427,10 @@ fn charger_jeton() -> Result<String, Box<dyn std::error::Error>> {
     Ok(jeton)
 }
 
+/// Convertit les options de mode de la ligne de commande en paramètres console.
+///
+/// Entrée : arguments analysés par Clap.
+/// Sortie : mode d'exécution et paramètres dates/fichier, ou erreur si une option requise manque.
 fn parametres_console(
     arguments: &Arguments,
 ) -> Result<(ModeExecution, String, String, String), String> {
@@ -428,7 +463,9 @@ fn parametres_console(
 }
 
 /// Affiche statuts et alertes jusqu'à la fin du test, une erreur ou Ctrl+C.
-/// En temps réel et en simulation, les analyses sont déjà tracées par les logs.
+///
+/// Entrées : mode d'exécution et récepteurs des signaux visuels et notifications du moteur.
+/// Sortie : `Ok(())` à l'arrêt normal ou à Ctrl+C, erreur si le moteur échoue.
 async fn boucle_console(
     mode: ModeExecution,
     mut rx_signaux: mpsc::Receiver<SignalVisuel>,
@@ -482,7 +519,10 @@ struct Contexte {
 
 type Historiques = HashMap<String, Vec<Bougie>>;
 
-/// Moteur : exécute une session à la fois et remplace la précédente à chaque commande de l'IHM.
+/// Exécute une session à la fois et remplace la précédente à chaque commande de l'IHM.
+///
+/// Entrées : configuration, canaux de sortie et récepteur des commandes.
+/// Sortie : tourne jusqu'à fermeture du canal de commandes; les erreurs de session sont notifiées.
 async fn moteur(
     config: Arc<ConfigurationApplication>,
     tx_ui: mpsc::Sender<SignalVisuel>,
@@ -539,30 +579,49 @@ async fn moteur(
 }
 
 impl Contexte {
+    /// Envoie une notification de statut associée à la génération courante.
+    ///
+    /// Entrée : texte du statut.
+    /// Sortie : envoie la notification si le récepteur est encore ouvert.
     fn statut(&self, texte: impl Into<String>) {
         let _ = self
             .tx_statut
             .send((self.generation, NotificationMoteur::Statut(texte.into())));
     }
 
+    /// Envoie une notification d'erreur de source associée à la génération courante.
+    ///
+    /// Entrée : texte de l'erreur.
+    /// Sortie : envoie la notification si le récepteur est encore ouvert.
     fn erreur(&self, texte: impl Into<String>) {
         let _ = self
             .tx_statut
             .send((self.generation, NotificationMoteur::Erreur(texte.into())));
     }
 
+    /// Envoie une notification d'échec de session associée à la génération courante.
+    ///
+    /// Entrée : texte de l'échec.
+    /// Sortie : envoie la notification si le récepteur est encore ouvert.
     fn echec(&self, texte: impl Into<String>) {
         let _ = self
             .tx_statut
             .send((self.generation, NotificationMoteur::Echec(texte.into())));
     }
 
+    /// Retourne le délai entre les requêtes réseau configuré pour cette session.
+    ///
+    /// Sortie : délai en millisecondes enveloppé dans `Some`.
     fn delai_reseau(&self) -> Option<Duration> {
         Some(Duration::from_millis(
             self.config.reseau.delai_limitation_debit_ms,
         ))
     }
 
+    /// Charge, agrège puis écoute les bougies des fournisseurs sélectionnés.
+    ///
+    /// Entrées : configuration et paramétrages de la session, ainsi que ses canaux de sortie.
+    /// Sortie : `Ok(())` à l'arrêt normal ou `Err` si l'historique de préchauffage est insuffisant.
     async fn temps_reel(&self) -> Result<(), String> {
         let symboles = &self.config.paires.symboles;
         let fournisseurs = &self.fournisseurs;
@@ -724,6 +783,11 @@ impl Contexte {
         Ok(())
     }
 
+    /// Agrège les mises à jour reçues et les transmet à l'analyse du moteur.
+    ///
+    /// Entrées : historiques à compléter, canal multi-sources, fournisseurs attendus et bougies
+    /// initiales à intégrer.
+    /// Sortie : se termine lorsque le canal est fermé ou que l'envoi à l'IHM échoue.
     async fn traiter_flux_agrege(
         &self,
         historiques: &mut Historiques,
@@ -764,6 +828,9 @@ impl Contexte {
         }
     }
 
+    /// Initialise les historiques fictifs et traite le flux simulé en continu.
+    ///
+    /// Sortie : `Ok(())` lorsque l'IHM ferme son canal ou que le flux s'arrête.
     async fn simulation(&self) -> Result<(), String> {
         let symboles = &self.config.paires.symboles;
 
@@ -801,6 +868,9 @@ impl Contexte {
     }
 
     /// Télécharge sur Binance la plage `[debut, fin]` de chaque paire puis la rejoue bougie par bougie.
+    ///
+    /// Entrées : dates au format `AAAA-MM-JJ` et symboles à tester.
+    /// Sortie : résultat du rejeu, ou erreur de date, de téléchargement, d'écriture ou de traitement.
     async fn test_periode(
         &self,
         debut: &str,
@@ -869,7 +939,10 @@ impl Contexte {
         .await
     }
 
-    /// Rejoue un fichier JSON contenant une liste de bougies.
+    /// Charge, filtre puis rejoue un fichier JSON contenant une liste de bougies.
+    ///
+    /// Entrées : chemin du fichier et symboles à tester.
+    /// Sortie : résultat du rejeu, ou erreur si le fichier ou les symboles sont invalides.
     async fn test_fichier(&self, chemin: &str, symboles: &[String]) -> Result<(), String> {
         if !chemin.to_lowercase().ends_with(".json") {
             return Err("Seuls les fichiers JSON (liste de bougies) sont pris en charge".into());
@@ -899,6 +972,9 @@ impl Contexte {
     }
 
     /// Analyse les bougies dans l'ordre chronologique, toutes paires confondues.
+    ///
+    /// Entrées : historiques de préchauffage, bougies à rejouer et description affichée du test.
+    /// Sortie : `Ok(())` à la fin ou à l'arrêt de l'IHM, sinon erreur de traitement.
     async fn rejouer(
         &self,
         mut historiques: Historiques,
@@ -924,6 +1000,10 @@ impl Contexte {
         Ok(())
     }
 
+    /// Reçoit les bougies d'un flux et les transmet une à une à l'analyse.
+    ///
+    /// Entrées : historiques à mettre à jour et canal de bougies.
+    /// Sortie : se termine lorsque le canal est fermé ou que l'IHM ne reçoit plus les signaux.
     async fn traiter_flux(&self, historiques: &mut Historiques, mut rx: mpsc::Receiver<Bougie>) {
         while let Some(bougie) = rx.recv().await {
             if self
@@ -936,7 +1016,10 @@ impl Contexte {
         }
     }
 
-    /// Envoie à l'IHM la dernière bougie clôturée de chaque paire. `false` si l'IHM est fermée.
+    /// Envoie à l'IHM la dernière bougie clôturée de chaque paire.
+    ///
+    /// Entrée : historiques indexés par symbole.
+    /// Sortie : `true` si tous les signaux ont été envoyés, `false` si l'IHM est fermée.
     async fn publier_dernieres(&self, historiques: &Historiques) -> bool {
         for historique in historiques.values() {
             if let Some(derniere) = historique.last() {
@@ -955,8 +1038,10 @@ impl Contexte {
         true
     }
 
-    /// Analyse une bougie et envoie le signal à l'IHM. Retourne `None` si l'IHM est fermée,
-    /// sinon `Some(est_alerte)`.
+    /// Met à jour l'historique, analyse une bougie et envoie le signal à l'IHM.
+    ///
+    /// Entrées : historiques à modifier, bougie à analyser et indicateur de rejeu.
+    /// Sortie : `Some(est_alerte)` si l'envoi réussit et si le symbole est connu, sinon `None`.
     async fn traiter_bougie(
         &self,
         historiques: &mut Historiques,
@@ -991,6 +1076,10 @@ impl Contexte {
     }
 }
 
+/// Vérifie les symboles demandés et retire les autres bougies du fichier chargé.
+///
+/// Entrées : bougies lues, symboles à conserver et chemin utilisé dans les messages d'erreur.
+/// Sortie : bougies filtrées ou erreur si le fichier est vide ou ne contient pas une paire demandée.
 fn filtrer_bougies_par_symboles(
     mut bougies: Vec<Bougie>,
     symboles: &[String],
@@ -1021,7 +1110,10 @@ fn filtrer_bougies_par_symboles(
     Ok(bougies)
 }
 
-/// Convertit deux dates `AAAA-MM-JJ` en bornes UTC en millisecondes (fin incluse, jusqu'à 23:59:59.999).
+/// Convertit deux dates `AAAA-MM-JJ` en bornes UTC en millisecondes, fin de journée incluse.
+///
+/// Entrées : date de début et date de fin.
+/// Sortie : intervalle Unix en millisecondes inclusif, ou erreur si les dates sont invalides.
 fn plage_en_millisecondes(debut: &str, fin: &str) -> Result<(i64, i64), String> {
     let lire = |texte: &str, nom: &str| {
         NaiveDate::parse_from_str(texte.trim(), "%Y-%m-%d")
@@ -1042,6 +1134,10 @@ fn plage_en_millisecondes(debut: &str, fin: &str) -> Result<(i64, i64), String> 
     Ok((minuit(debut)?, minuit(lendemain)? - 1))
 }
 
+/// Calcule les indicateurs, la tendance, le score et le signal visuel d'une bougie.
+///
+/// Entrées : historique, bougie évaluée, stratégie, génération de session et mode rejeu.
+/// Sortie : signal prêt à être envoyé à l'IHM.
 fn construire_signal(
     historique: &[Bougie],
     bougie: &Bougie,

@@ -15,11 +15,18 @@ const VOLATILITE: f64 = 0.005;
 struct Alea(u64);
 
 impl Alea {
+    /// Initialise le générateur pseudo-aléatoire avec une graine non nulle.
+    ///
+    /// Entrée : graine entière.
+    /// Sortie : générateur déterministe initialisé.
     fn nouveau(graine: u64) -> Self {
         Self(graine | 1)
     }
 
-    /// Nombre uniforme dans [0, 1).
+    /// Produit le prochain nombre pseudo-aléatoire uniforme dans `[0, 1)`.
+    ///
+    /// Entrée : état courant du générateur.
+    /// Sortie : valeur pseudo-aléatoire et état du générateur avancé.
     fn suivant(&mut self) -> f64 {
         self.0 ^= self.0 >> 12;
         self.0 ^= self.0 << 25;
@@ -28,24 +35,37 @@ impl Alea {
         (valeur >> 11) as f64 / (1u64 << 53) as f64
     }
 
-    /// Nombre uniforme dans [-1, 1).
+    /// Produit le prochain nombre pseudo-aléatoire uniforme dans `[-1, 1)`.
+    ///
+    /// Entrée : état courant du générateur.
+    /// Sortie : valeur centrée dérivée de [`Alea::suivant`].
     fn centre(&mut self) -> f64 {
         self.suivant() * 2.0 - 1.0
     }
 }
 
 /// Hash FNV-1a, pour dériver un prix de départ stable par symbole.
+///
+/// Entrée : texte à hacher.
+/// Sortie : empreinte entière déterministe.
 fn hacher(texte: &str) -> u64 {
     texte.bytes().fold(0xcbf2_9ce4_8422_2325, |h, o| {
         (h ^ u64::from(o)).wrapping_mul(0x0000_0100_0000_01b3)
     })
 }
 
+/// Calcule un prix de départ stable à partir du symbole.
+///
+/// Entrée : symbole de la paire.
+/// Sortie : prix positif déterministe utilisé par le flux simulé.
 fn prix_depart(symbole: &str) -> f64 {
     50.0 + (hacher(symbole) % 50_000) as f64
 }
 
 /// Durée d'une unité de temps Binance (`1m`, `1h`, `1d`...) ; 1 heure par défaut.
+///
+/// Entrée : unité de temps à convertir.
+/// Sortie : durée correspondante; une unité mal formée utilise les valeurs de repli du simulateur.
 fn duree_unite(unite_temps: &str) -> chrono::Duration {
     let (nombre, suffixe) = unite_temps.split_at(unite_temps.len().saturating_sub(1));
     let n: i64 = nombre.parse().unwrap_or(1).max(1);
@@ -60,6 +80,9 @@ fn duree_unite(unite_temps: &str) -> chrono::Duration {
 
 /// Génère `nombre` bougies fermées fictives (marche aléatoire) se terminant au prix de départ
 /// utilisé par [`simuler_flux_temps_reel`], de la plus ancienne à la plus récente.
+///
+/// Entrées : symbole, unité de temps et nombre de bougies.
+/// Sortie : historique synthétique ordonné chronologiquement.
 pub fn generer_historique_fictif(symbole: &str, unite_temps: &str, nombre: usize) -> Vec<Bougie> {
     let mut alea =
         Alea::nouveau(hacher(symbole) ^ Utc::now().timestamp_nanos_opt().unwrap_or(1) as u64);
@@ -101,7 +124,8 @@ pub fn generer_historique_fictif(symbole: &str, unite_temps: &str, nombre: usize
 
 /// Émet toutes les 2 secondes une bougie fermée simulée par symbole, sans fin.
 ///
-/// Ne rend la main que si `symboles` est vide ou si le récepteur de `tx` est fermé.
+/// Entrées : symboles, unité de temps et canal recevant les bougies.
+/// Sortie : tourne jusqu'à ce que la liste soit vide ou que le récepteur du canal soit fermé.
 pub async fn simuler_flux_temps_reel(symboles: &[String], unite_temps: &str, tx: Sender<Bougie>) {
     if symboles.is_empty() {
         warn!("Aucun symbole à simuler : flux simulé non démarré");

@@ -59,6 +59,10 @@ pub struct ConnexionUi {
     pub tx_commandes: mpsc::UnboundedSender<CommandeMoteur>,
 }
 
+/// Connecte l'IHM au moteur, l'authentifie et crée les canaux d'échange.
+///
+/// Entrées : adresse TCP du moteur et jeton d'authentification.
+/// Sortie : état initial et canaux de signaux, statuts et commandes, ou erreur réseau/protocole.
 pub async fn connecter(
     adresse: &str,
     jeton: String,
@@ -184,6 +188,11 @@ pub async fn connecter(
     })
 }
 
+/// Sert de relais TCP entre les clients IHM et le moteur.
+///
+/// Entrées : listener, jeton, état initial, canal des commandes moteur, chemin de sauvegarde
+/// et récepteurs des signaux/statuts.
+/// Sortie : tourne jusqu'à Ctrl+C ou une erreur de listener/canal.
 pub async fn servir(
     listener: TcpListener,
     jeton: String,
@@ -346,6 +355,10 @@ pub async fn servir(
     }
 }
 
+/// Authentifie un client, puis relaie ses commandes et les événements du moteur.
+///
+/// Entrées : connexion TCP, jeton attendu, diffuseur d'événements, état partagé et canal moteur.
+/// Sortie : ferme la connexion après déconnexion, erreur de protocole ou arrêt du moteur.
 async fn gerer_client(
     stream: TcpStream,
     jeton_attendu: Arc<str>,
@@ -442,6 +455,10 @@ async fn gerer_client(
     }
 }
 
+/// Lit une ligne UTF-8 sans dépasser la taille maximale des messages réseau.
+///
+/// Entrées : lecteur asynchrone et chaîne à remplir.
+/// Sortie : nombre d'octets lus, `0` à la fin du flux, ou erreur d'I/O/limite/encodage.
 async fn lire_ligne_limitee<R>(lecteur: &mut R, ligne: &mut String) -> std::io::Result<usize>
 where
     R: AsyncBufRead + Unpin,
@@ -480,6 +497,10 @@ where
     Ok(ligne.len())
 }
 
+/// Affiche une notification du moteur au niveau de journal approprié.
+///
+/// Entrée : notification à afficher.
+/// Sortie : écrit le statut sur stdout et les erreurs sur stderr.
 fn afficher_notification(notification: &NotificationMoteur) {
     match notification {
         NotificationMoteur::Statut(texte) => println!("{texte}"),
@@ -488,6 +509,10 @@ fn afficher_notification(notification: &NotificationMoteur) {
     }
 }
 
+/// Sérialise un message JSON et l'écrit sur une ligne du flux réseau.
+///
+/// Entrées : writer asynchrone et message sérialisable.
+/// Sortie : `Ok(())` après écriture et vidage, ou erreur de sérialisation/I/O.
 async fn ecrire_message<W, T>(
     ecrivain: &mut W,
     message: &T,

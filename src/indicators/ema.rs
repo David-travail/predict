@@ -9,6 +9,9 @@
 /// Retourne `None` si `periode` vaut 0 ou si la série est trop courte. Sinon le
 /// vecteur contient `prix.len() - periode + 1` valeurs, alignées sur les prix à
 /// partir de l'indice `periode - 1`.
+///
+/// Entrées : série de prix et période de calcul.
+/// Sortie : série EMA alignée sur la première fenêtre complète, ou `None` si les entrées sont insuffisantes.
 pub fn calculer_ema(prix: &[f64], periode: usize) -> Option<Vec<f64>> {
     if periode == 0 || prix.len() < periode {
         return None;
