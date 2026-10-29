@@ -4,4 +4,5 @@ pub mod reseau;
 pub mod rest;
 pub mod simulation;
 pub mod sources;
+pub mod telegram;
 pub mod websocket;

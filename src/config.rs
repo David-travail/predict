@@ -20,12 +20,23 @@ pub struct ConfigurationApplication {
     pub reseau: ConfigurationReseau,
     #[serde(rename = "data_sources", default)]
     pub sources_donnees: ConfigurationSources,
+    #[serde(rename = "telegram", default)]
+    pub telegram: ConfigurationTelegram,
     /// Blocs de paires (`[groups.<nom>]`), chacun avec son paramétrage optionnel.
     #[serde(rename = "groups", default)]
     pub groupes: BTreeMap<String, ConfigurationGroupe>,
     /// Paramétrage propre à une paire (`[overrides.<SYMBOLE>]`).
     #[serde(rename = "overrides", default)]
     pub surcharges: BTreeMap<String, ConfigurationStrategie>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ConfigurationTelegram {
+    #[serde(rename = "bot_token")]
+    pub jeton_bot: String,
+    #[serde(rename = "chat_id")]
+    pub identifiant_chat: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -200,6 +211,15 @@ impl ConfigurationApplication {
             self.sources_donnees.fournisseurs.iter().collect();
         if fournisseurs.len() != self.sources_donnees.fournisseurs.len() {
             return Err("'data_sources.providers' ne peut pas contenir de doublons".into());
+        }
+
+        let jeton_telegram_configure = !self.telegram.jeton_bot.trim().is_empty();
+        let chat_telegram_configure = !self.telegram.identifiant_chat.trim().is_empty();
+        if jeton_telegram_configure != chat_telegram_configure {
+            return Err(
+                "'telegram.bot_token' et 'telegram.chat_id' doivent être configurés ensemble"
+                    .into(),
+            );
         }
 
         self.parametrages().valider()
@@ -534,6 +554,8 @@ mod tests {
         assert_eq!(configuration.strategie.adx.periode, 14);
         assert_eq!(configuration.strategie.volume.periode_moyenne_mobile, 20);
         assert_eq!(configuration.reseau.delai_limitation_debit_ms, 200);
+        assert!(configuration.telegram.jeton_bot.is_empty());
+        assert!(configuration.telegram.identifiant_chat.is_empty());
         assert_eq!(
             configuration.sources_donnees.fournisseurs,
             vec![
@@ -542,6 +564,20 @@ mod tests {
                 Fournisseur::Coinbase
             ]
         );
+    }
+
+    #[test]
+    fn lit_et_valide_les_identifiants_telegram() {
+        let toml = toml_exemple().replace(
+            "[network]",
+            "[telegram]\nbot_token = \"token-test\"\nchat_id = \"12345\"\n\n[network]",
+        );
+        let configuration = ConfigurationApplication::depuis_toml(&toml).unwrap();
+        assert_eq!(configuration.telegram.jeton_bot, "token-test");
+        assert_eq!(configuration.telegram.identifiant_chat, "12345");
+
+        let incomplet = toml.replace("chat_id = \"12345\"", "chat_id = \"\"");
+        assert!(ConfigurationApplication::depuis_toml(&incomplet).is_err());
     }
 
     #[test]

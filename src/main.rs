@@ -15,6 +15,9 @@ use crate::core::scoring::calculer_score;
 use crate::data::rest::{telecharger_bougies_periode, telecharger_plage_bougies};
 use crate::data::simulation::{generer_historique_fictif, simuler_flux_temps_reel};
 use crate::data::sources::{Agregateur, BougieSourcee, Fournisseur, agreger_historique};
+use crate::data::telegram::{
+    ConfigurationTelegram as ConfigurationCanalTelegram, NotificateurTelegram,
+};
 use crate::data::websocket::ecouter_flux_temps_reel;
 use crate::indicators::adx::calculer_adx;
 use crate::indicators::ema::calculer_ema;
@@ -30,11 +33,14 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use tracing::{Level, error, info, warn};
-use tracing_subscriber::FmtSubscriber;
+use tracing_subscriber::Layer;
+use tracing_subscriber::filter::filter_fn;
 use tracing_subscriber::fmt::writer::MakeWriterExt;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 /// Nombre de bougies antérieures au début d'un test, nécessaires pour amorcer EMA 200 et ADX.
 const BOUGIES_PRECHAUFFAGE: usize = 200;
@@ -156,6 +162,18 @@ fn charger_parametrages(
     parametrages
 }
 
+fn configuration_telegram(config: &ConfigurationApplication) -> Option<ConfigurationCanalTelegram> {
+    let jeton_bot = config.telegram.jeton_bot.trim();
+    let identifiant_chat = config.telegram.identifiant_chat.trim();
+    if jeton_bot.is_empty() || identifiant_chat.is_empty() {
+        return None;
+    }
+    Some(ConfigurationCanalTelegram::depuis_identifiants(
+        jeton_bot.to_owned(),
+        identifiant_chat.to_owned(),
+    ))
+}
+
 /// Rattache le processus à la console du terminal qui l'a lancé, pour que `println!`, les logs
 /// et `--help` s'affichent malgré le sous-système « windows ».
 ///
@@ -238,15 +256,28 @@ fn executer(_avec_arguments: bool) -> Result<(), Box<dyn std::error::Error>> {
     let arguments = Arguments::parse();
 
     // 1. Initialisation des journaux (logs)
-    let fichier_log = OpenOptions::new()
+    let fichier_messages = OpenOptions::new()
         .create(true)
         .append(true)
         .open("predict.log")?;
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(Level::INFO)
-        .with_writer(std::io::stdout.and(fichier_log))
-        .finish();
-    tracing::subscriber::set_global_default(subscriber)?;
+    let fichier_erreurs = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("predict-erreurs.log")?;
+    let couche_messages = tracing_subscriber::fmt::layer()
+        .with_ansi(false)
+        .with_writer(std::io::stdout.and(fichier_messages))
+        .with_filter(filter_fn(|metadata| *metadata.level() == Level::INFO));
+    let couche_erreurs = tracing_subscriber::fmt::layer()
+        .with_ansi(false)
+        .with_writer(std::io::stderr.and(fichier_erreurs))
+        .with_filter(filter_fn(|metadata| {
+            matches!(*metadata.level(), Level::WARN | Level::ERROR)
+        }));
+    tracing_subscriber::registry()
+        .with(couche_messages)
+        .with(couche_erreurs)
+        .try_init()?;
 
     info!("Démarrage du Détecteur Crypto H24...");
 
@@ -260,6 +291,7 @@ fn executer(_avec_arguments: bool) -> Result<(), Box<dyn std::error::Error>> {
     let runtime = tokio::runtime::Runtime::new()?;
 
     if arguments.local {
+        let configuration_telegram = configuration_telegram(&config);
         let (tx_ui, rx_ui) = mpsc::channel::<SignalVisuel>(256);
         let (tx_commandes, rx_commandes) = mpsc::unbounded_channel::<CommandeMoteur>();
         let (tx_statut, rx_statut) = mpsc::unbounded_channel::<(u64, NotificationMoteur)>();
@@ -278,6 +310,7 @@ fn executer(_avec_arguments: bool) -> Result<(), Box<dyn std::error::Error>> {
             tx_ui,
             tx_statut,
             rx_commandes,
+            configuration_telegram,
         ));
         let options = eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default().with_inner_size([900.0, 600.0]),
@@ -304,6 +337,7 @@ fn executer(_avec_arguments: bool) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if arguments.console {
+        let configuration_telegram = configuration_telegram(&config);
         let (tx_ui, rx_ui) = mpsc::channel::<SignalVisuel>(256);
         let (tx_commandes, rx_commandes) = mpsc::unbounded_channel::<CommandeMoteur>();
         let (tx_statut, rx_statut) = mpsc::unbounded_channel::<(u64, NotificationMoteur)>();
@@ -318,7 +352,13 @@ fn executer(_avec_arguments: bool) -> Result<(), Box<dyn std::error::Error>> {
             parametrages,
             fournisseurs: config.sources_donnees.fournisseurs.clone(),
         })?;
-        runtime.spawn(moteur(Arc::new(config), tx_ui, tx_statut, rx_commandes));
+        runtime.spawn(moteur(
+            Arc::new(config),
+            tx_ui,
+            tx_statut,
+            rx_commandes,
+            configuration_telegram,
+        ));
         let resultat = runtime.block_on(boucle_console(mode, rx_ui, rx_statut));
         drop(tx_commandes);
         runtime.shutdown_background();
@@ -326,6 +366,7 @@ fn executer(_avec_arguments: bool) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if arguments.serve {
+        let configuration_telegram = configuration_telegram(&config);
         let jeton = charger_jeton()?;
         let adresse = arguments
             .listen
@@ -356,7 +397,13 @@ fn executer(_avec_arguments: bool) -> Result<(), Box<dyn std::error::Error>> {
         };
         let resultat = runtime.block_on(async {
             let listener = tokio::net::TcpListener::from_std(listener)?;
-            runtime.spawn(moteur(Arc::new(config), tx_ui, tx_statut, rx_commandes));
+            runtime.spawn(moteur(
+                Arc::new(config),
+                tx_ui,
+                tx_statut,
+                rx_commandes,
+                configuration_telegram,
+            ));
             ipc::servir(
                 listener,
                 jeton,
@@ -515,6 +562,8 @@ struct Contexte {
     generation: u64,
     parametrages: Parametrages,
     fournisseurs: Vec<Fournisseur>,
+    notificateur: Option<NotificateurTelegram>,
+    dernieres_tendances: Mutex<HashMap<String, Tendance>>,
 }
 
 type Historiques = HashMap<String, Vec<Bougie>>;
@@ -528,7 +577,14 @@ async fn moteur(
     tx_ui: mpsc::Sender<SignalVisuel>,
     tx_statut: mpsc::UnboundedSender<(u64, NotificationMoteur)>,
     mut rx_commandes: mpsc::UnboundedReceiver<CommandeMoteur>,
+    configuration_telegram: Option<ConfigurationCanalTelegram>,
 ) {
+    let notificateur = configuration_telegram.map(ConfigurationCanalTelegram::demarrer);
+    if let Some(notificateur) = &notificateur
+        && let Err(erreur) = notificateur.notifier("✅ Moteur Predict démarré.".into())
+    {
+        error!("{erreur}");
+    }
     let mut session: Option<JoinHandle<()>> = None;
 
     while let Some(commande) = rx_commandes.recv().await {
@@ -557,6 +613,12 @@ async fn moteur(
             generation,
             parametrages,
             fournisseurs,
+            notificateur: if matches!(mode, ModeExecution::TempsReel) {
+                notificateur.clone()
+            } else {
+                None
+            },
+            dernieres_tendances: Mutex::new(HashMap::new()),
         };
         session = Some(tokio::spawn(async move {
             let resultat = match mode {
@@ -716,6 +778,7 @@ impl Contexte {
             historiques.insert(symbole.to_uppercase(), bougies);
         }
 
+        self.initialiser_tendances(&historiques).await;
         if !self.publier_dernieres(&historiques).await {
             return Ok(());
         }
@@ -1071,8 +1134,41 @@ impl Contexte {
             rejeu,
         );
         let est_alerte = signal.est_alerte;
+        if !rejeu && bougie.cloturee {
+            if let Some(notificateur) = &self.notificateur {
+                let mut tendances = self.dernieres_tendances.lock().await;
+                let precedente = tendances.insert(signal.symbole.clone(), signal.tendance);
+                let direction = tendance_notifiable(precedente, signal.tendance);
+                if let Some(direction) = direction {
+                    let message = format!(
+                        "Tendance en {direction}\nPaire : {}\nPériode : {}\nPrix : {:.8}\nScore : {}/100\nHeure : {}",
+                        signal.symbole, signal.unite, signal.prix, signal.score, signal.horodatage
+                    );
+                    if let Err(erreur) = notificateur.notifier(message) {
+                        error!("{erreur}");
+                    }
+                }
+            }
+        }
         self.tx_ui.send(signal).await.ok()?;
         Some(est_alerte)
+    }
+
+    async fn initialiser_tendances(&self, historiques: &Historiques) {
+        let mut tendances = self.dernieres_tendances.lock().await;
+        tendances.clear();
+        for historique in historiques.values() {
+            if let Some(derniere) = historique.last() {
+                tendances.insert(
+                    derniere.symbole.to_uppercase(),
+                    calculer_tendance(
+                        historique,
+                        derniere,
+                        self.parametrages.resoudre(&derniere.symbole),
+                    ),
+                );
+            }
+        }
     }
 }
 
@@ -1145,11 +1241,9 @@ fn construire_signal(
     generation: u64,
     rejeu: bool,
 ) -> SignalVisuel {
-    let prix: Vec<f64> = historique.iter().map(|b| b.cloture).collect();
     let volumes: Vec<f64> = historique.iter().map(|b| b.volume).collect();
     let periode_volume = strategie.volume.periode_moyenne_mobile as usize;
 
-    let emas = calculer_ema(&prix, strategie.filtre_macro.periode_ema as usize);
     let valeur_adx = calculer_adx(historique, strategie.adx.periode as usize).unwrap_or(0.0);
     let (volume_valide, ratio_vol) = valider_cassure_volume(
         bougie.volume,
@@ -1158,25 +1252,7 @@ fn construire_signal(
         strategie.volume.multiplicateur,
     );
 
-    let dernier_ema = emas.as_ref().and_then(|v| v.last().copied());
-    // Avec Supertrend activé, il doit confirmer le sens donné par l'EMA ; sans donnée, pas de tendance.
-    let supertrend = if strategie.filtre_macro.utiliser_supertrend {
-        supertrend_haussier(
-            historique,
-            strategie.filtre_macro.periode_supertrend as usize,
-            strategie.filtre_macro.multiplicateur_supertrend,
-        )
-    } else {
-        None
-    };
-    let confirme = |haussier: bool| {
-        !strategie.filtre_macro.utiliser_supertrend || supertrend == Some(haussier)
-    };
-    let tendance = match dernier_ema {
-        Some(ema) if bougie.cloture > ema && confirme(true) => Tendance::Haussiere,
-        Some(ema) if bougie.cloture < ema && confirme(false) => Tendance::Baissiere,
-        _ => Tendance::Neutre,
-    };
+    let tendance = calculer_tendance(historique, bougie, strategie);
     let adx_valide = valeur_adx >= strategie.adx.seuil_minimal;
     let analyse = AnalyseTechnique {
         tendance,
@@ -1230,6 +1306,42 @@ fn construire_signal(
         est_alerte: est_une_alerte,
         unite: bougie.unite_temps.clone(),
         horodatage,
+    }
+}
+
+fn calculer_tendance(
+    historique: &[Bougie],
+    bougie: &Bougie,
+    strategie: &ConfigurationStrategie,
+) -> Tendance {
+    let prix: Vec<f64> = historique.iter().map(|b| b.cloture).collect();
+    let dernier_ema = calculer_ema(&prix, strategie.filtre_macro.periode_ema as usize)
+        .and_then(|emas| emas.last().copied());
+    // Avec Supertrend activé, il doit confirmer le sens donné par l'EMA ; sans donnée, pas de tendance.
+    let supertrend = if strategie.filtre_macro.utiliser_supertrend {
+        supertrend_haussier(
+            historique,
+            strategie.filtre_macro.periode_supertrend as usize,
+            strategie.filtre_macro.multiplicateur_supertrend,
+        )
+    } else {
+        None
+    };
+    let confirme = |haussier: bool| {
+        !strategie.filtre_macro.utiliser_supertrend || supertrend == Some(haussier)
+    };
+    match dernier_ema {
+        Some(ema) if bougie.cloture > ema && confirme(true) => Tendance::Haussiere,
+        Some(ema) if bougie.cloture < ema && confirme(false) => Tendance::Baissiere,
+        _ => Tendance::Neutre,
+    }
+}
+
+fn tendance_notifiable(precedente: Option<Tendance>, courante: Tendance) -> Option<&'static str> {
+    match courante {
+        Tendance::Haussiere if precedente != Some(courante) => Some("hausse 📈"),
+        Tendance::Baissiere if precedente != Some(courante) => Some("baisse 📉"),
+        Tendance::Haussiere | Tendance::Baissiere | Tendance::Neutre => None,
     }
 }
 
@@ -1297,5 +1409,25 @@ mod tests {
         .unwrap_err();
 
         assert!(erreur.contains("SOLEUR"));
+    }
+
+    #[test]
+    fn notifie_uniquement_les_changements_vers_une_tendance_directionnelle() {
+        assert_eq!(
+            tendance_notifiable(None, Tendance::Haussiere),
+            Some("hausse 📈")
+        );
+        assert_eq!(
+            tendance_notifiable(Some(Tendance::Haussiere), Tendance::Haussiere),
+            None
+        );
+        assert_eq!(
+            tendance_notifiable(Some(Tendance::Haussiere), Tendance::Neutre),
+            None
+        );
+        assert_eq!(
+            tendance_notifiable(Some(Tendance::Haussiere), Tendance::Baissiere),
+            Some("baisse 📉")
+        );
     }
 }

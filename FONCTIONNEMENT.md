@@ -50,11 +50,21 @@ Valeurs par défaut (`config.toml`) : unité `1h`, EMA 200 + Supertrend, ADX 14 
 ### Architecture
 - `predict --serve` lance le moteur Tokio et son serveur de contrôle réseau dans la console ; l'IHM lancée séparément se connecte au moteur (`predict` par défaut sur `127.0.0.1:8765`, ou `predict --connect <IP>:8765`). Le serveur écoute par défaut sur `0.0.0.0:8765` ; `--listen` permet de choisir une autre adresse. L'IHM peut changer de mode et arrêter/redémarrer le traitement. Fermer ou perdre l'IHM ne coupe pas le moteur ; seul `Ctrl+C` dans la console du serveur l'arrête.
 - `predict --local` lance le moteur et l'IHM ensemble dans le même processus, sans serveur réseau ; fermer la fenêtre de l'IHM arrête également le moteur.
+- Les notifications Telegram sont facultatives et se configurent dans la section `[telegram]` de `config.toml`. Renseigner ensemble `bot_token` et `chat_id` pour les activer ; les laisser vides pour les désactiver. Le moteur envoie un message à son démarrage, puis une notification lorsqu'une bougie clôturée fait passer la tendance d'une paire à la hausse ou à la baisse. Les mises à jour provisoires, la simulation et les rejeux historiques ne déclenchent pas de notification de tendance. Les erreurs d'envoi sont consignées dans `predict-erreurs.log` ; si la réponse HTTP n'est pas au format Telegram, un extrait du corps reçu est ajouté au diagnostic (jeton masqué et séquences ANSI retirées).
+
+```toml
+[telegram]
+bot_token = "jeton fourni par BotFather"
+chat_id = "identifiant de la conversation"
+```
+
+Le fichier de configuration pouvant contenir le secret du bot, ne pas versionner un jeton réel.
+
 - Le serveur exige le même secret dans la variable d'environnement `PREDICT_TOKEN` côté moteur et côté IHM (au moins 16 caractères). Les messages sont échangés en TCP/JSON ; le trafic n'est pas chiffré, donc utiliser un réseau privé de confiance ou un VPN.
 - « Sauvegarder » écrit les paramétrages sur la machine du moteur ; ils seront rechargés au prochain démarrage du serveur.
 - `predict --console` reste disponible pour une analyse console autonome (sans serveur ni IHM).
 - Les signaux et statuts du moteur sont transmis à l'IHM ; les erreurs des sources sont journalisées et affichées dans une boîte de dialogue ; la barre d'état du temps réel n'affiche que les noms des flux actifs.
-- Les logs de niveau INFO et supérieur sont affichés dans la console et ajoutés à `predict.log` dans le dossier de lancement de l'application.
+- Les messages de niveau INFO sont affichés sur la sortie standard et enregistrés dans `predict.log`. Les avertissements (WARN) et erreurs (ERROR) sont affichés sur la sortie d'erreur et enregistrés dans `predict-erreurs.log`. Les séquences ANSI de couleur sont désactivées. Les deux fichiers sont créés dans le dossier de lancement de l'application.
 - Modes : **temps-reel** (sources activées dans `[data_sources]` : Binance, Kraken et Coinbase), **simulation** (prix fictifs), **periode** (backtest téléchargé depuis Binance, sauvegardé dans `historique_<début>_<fin>.json`), **fichier** (rejeu d'un JSON). L'unité de temps des bougies (`timeframes.execution`, 1h par défaut) est modifiable dans l'IHM (liste « Période » : 1m … 1d, prise en compte par « Appliquer »). Proxy HTTP possible (`[network] proxy`), délai minimal entre appels REST `rate_limit_ms` (200 ms).
 
 ### Sources de données en temps réel
@@ -69,6 +79,13 @@ providers = ["binance", "kraken", "coinbase"]
 Les bougies sont ramenées au symbole interne (par exemple `BTCEUR`) puis rapprochées par symbole, période et heure d'ouverture. Une bougie est agrégée dès que toutes les sources sélectionnées sont présentes, ou après 5 secondes si au moins deux sources concordent. Avec une seule source sélectionnée, ses bougies sont utilisées telles quelles. Ouverture, haut, bas et clôture sont les moyennes arithmétiques des sources reçues ; le volume est leur somme. Les mises à jour de sources supplémentaires sont intégrées tant que la bougie n'est pas clôturée. Si plusieurs sources sont sélectionnées, le démarrage requiert assez d'historique commun depuis au moins deux d'entre elles.
 
 Coinbase publie des transactions ; l'application reconstruit les bougies sur l'unité de temps configurée. Kraken publie ses bougies OHLC et Binance ses kline. Le préchauffage REST est téléchargé sur chaque source et la bougie courante est amorcée avec les valeurs REST avant le branchement des WebSockets ; les backtests par période restent actuellement basés sur Binance. Les trois API couvrent en commun `1m`, `5m`, `15m`, `1h` et `1d`. Les autres périodes dépendent des intervalles offerts par les fournisseurs ; le préchauffage doit obtenir 200 bougies concordantes sur au moins deux sources, sinon le démarrage échoue explicitement.
+
+### Rejeu d'un historique
+
+- **Fichier local** : sélectionner un fichier JSON contenant une liste de bougies (`symbole`, `unite_temps`, `instant_ouverture`, `ouverture`, `haut`, `bas`, `cloture`, `volume`, `cloturee`). Choisir également les paires à jouer ; chacune doit être présente dans le fichier. Les bougies des autres paires sont ignorées. Un fichier vide, illisible, mal formé ou ne contenant pas une paire sélectionnée provoque une erreur explicite.
+- Le moteur force toutes les bougies retenues à l'état clôturé, les trie par heure d'ouverture et les traite une par une, sans délai entre elles. Chaque paire dispose de son propre historique cumulatif, initialement vide ; la bougie traitée y est ajoutée avant le calcul des indicateurs. Cet historique est limité aux 300 dernières bougies.
+- À chaque étape, le score et le signal sont calculés avec les paramétrages actifs. L'IHM reçoit les signaux et ajoute les alertes à son journal ; leur horodatage correspond à l'heure d'ouverture de la bougie, affichée dans le fuseau local. La console du mode backtest n'affiche que les alertes. À la fin, un statut indique le nombre de bougies analysées et d'alertes détectées.
+- **Backtest par période** : les bougies de la période choisie sont également rejouées chronologiquement, mais les 200 bougies précédant le début sont chargées séparément pour amorcer les indicateurs ; elles ne sont pas comptées parmi les bougies rejouées. Le fichier `historique_<début>_<fin>.json` sauvegardé contient le préchauffage suivi des bougies de la période. Si ce fichier est ensuite ouvert en mode « Fichier local », toutes ses bougies — préchauffage compris — seront rejouées depuis un historique vide.
 
 ### Messages de l'API Binance
 
