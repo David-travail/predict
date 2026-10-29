@@ -22,6 +22,8 @@ pub struct ConfigurationApplication {
     pub sources_donnees: ConfigurationSources,
     #[serde(rename = "telegram", default)]
     pub telegram: ConfigurationTelegram,
+    #[serde(rename = "logs", default)]
+    pub journaux: ConfigurationJournaux,
     /// Blocs de paires (`[groups.<nom>]`), chacun avec son paramétrage optionnel.
     #[serde(rename = "groups", default)]
     pub groupes: BTreeMap<String, ConfigurationGroupe>,
@@ -37,6 +39,19 @@ pub struct ConfigurationTelegram {
     pub jeton_bot: String,
     #[serde(rename = "chat_id")]
     pub identifiant_chat: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ConfigurationJournaux {
+    #[serde(rename = "retention_days")]
+    pub jours_retention: usize,
+}
+
+impl Default for ConfigurationJournaux {
+    fn default() -> Self {
+        Self { jours_retention: 7 }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -220,6 +235,10 @@ impl ConfigurationApplication {
                 "'telegram.bot_token' et 'telegram.chat_id' doivent être configurés ensemble"
                     .into(),
             );
+        }
+
+        if self.journaux.jours_retention == 0 {
+            return Err("'logs.retention_days' doit être supérieur à 0".into());
         }
 
         self.parametrages().valider()
@@ -556,6 +575,7 @@ mod tests {
         assert_eq!(configuration.reseau.delai_limitation_debit_ms, 200);
         assert!(configuration.telegram.jeton_bot.is_empty());
         assert!(configuration.telegram.identifiant_chat.is_empty());
+        assert_eq!(configuration.journaux.jours_retention, 7);
         assert_eq!(
             configuration.sources_donnees.fournisseurs,
             vec![
@@ -578,6 +598,16 @@ mod tests {
 
         let incomplet = toml.replace("chat_id = \"12345\"", "chat_id = \"\"");
         assert!(ConfigurationApplication::depuis_toml(&incomplet).is_err());
+    }
+
+    #[test]
+    fn lit_et_valide_la_retention_des_journaux() {
+        let toml = toml_exemple().replace("[network]", "[logs]\nretention_days = 14\n\n[network]");
+        let configuration = ConfigurationApplication::depuis_toml(&toml).unwrap();
+        assert_eq!(configuration.journaux.jours_retention, 14);
+
+        let invalide = toml.replace("retention_days = 14", "retention_days = 0");
+        assert!(ConfigurationApplication::depuis_toml(&invalide).is_err());
     }
 
     #[test]

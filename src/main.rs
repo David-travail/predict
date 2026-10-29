@@ -28,7 +28,6 @@ use crate::ui::{CommandeMoteur, ModeExecution, NotificationMoteur, SignalVisuel}
 use chrono::{Local, NaiveDate};
 use clap::{Parser, ValueEnum};
 use std::collections::{HashMap, HashSet};
-use std::fs::OpenOptions;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -255,15 +254,24 @@ fn main() {
 fn executer(_avec_arguments: bool) -> Result<(), Box<dyn std::error::Error>> {
     let arguments = Arguments::parse();
 
+    // Charger la configuration avant les journaux pour appliquer leur rétention.
+    let config = charger_configuration(arguments.config.as_ref())?;
+
     // 1. Initialisation des journaux (logs)
-    let fichier_messages = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("predict.log")?;
-    let fichier_erreurs = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("predict-erreurs.log")?;
+    let appender_messages = tracing_appender::rolling::RollingFileAppender::builder()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix("predict")
+        .filename_suffix("log")
+        .max_log_files(config.journaux.jours_retention)
+        .build(".")?;
+    let (fichier_messages, _garde_messages) = tracing_appender::non_blocking(appender_messages);
+    let appender_erreurs = tracing_appender::rolling::RollingFileAppender::builder()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix("predict-erreur")
+        .filename_suffix("log")
+        .max_log_files(config.journaux.jours_retention)
+        .build(".")?;
+    let (fichier_erreurs, _garde_erreurs) = tracing_appender::non_blocking(appender_erreurs);
     let couche_messages = tracing_subscriber::fmt::layer()
         .with_ansi(false)
         .with_writer(std::io::stdout.and(fichier_messages))
@@ -281,8 +289,7 @@ fn executer(_avec_arguments: bool) -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Démarrage du Détecteur Crypto H24...");
 
-    // 2. Chargement de la configuration
-    let config = charger_configuration(arguments.config.as_ref())?;
+    // 2. Paramètres et démarrage
     info!("Paires surveillées : {:?}", config.paires.symboles);
     crate::data::reseau::definir_proxy(config.reseau.proxy.clone());
 

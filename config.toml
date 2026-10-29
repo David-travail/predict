@@ -29,6 +29,9 @@ proxy = "http://127.0.0.1:9000"
 [data_sources]
 providers = ["binance", "kraken", "coinbase"]
 
+[logs]
+retention_days = 7
+
 # Bloc de paires : paramétrage commun (optionnel) ; priorité : paire > bloc > [strategy].
 # [groups.majeures]
 # symbols = ["BTCEUR", "ETHEUR"]
