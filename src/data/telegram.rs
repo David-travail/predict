@@ -1,10 +1,15 @@
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info};
 
 const CAPACITE_FILE: usize = 32;
 const LONGUEUR_MAX_EXTRAIT: usize = 500;
+
+enum CommandeTelegram {
+    Message(String),
+    Attendre(oneshot::Sender<()>),
+}
 
 #[derive(Clone)]
 pub struct ConfigurationTelegram {
@@ -24,7 +29,7 @@ impl ConfigurationTelegram {
     ///
     /// Sortie : expéditeur borné des notifications du moteur.
     pub fn demarrer(self) -> NotificateurTelegram {
-        let (tx, mut rx) = mpsc::channel::<String>(CAPACITE_FILE);
+        let (tx, mut rx) = mpsc::channel::<CommandeTelegram>(CAPACITE_FILE);
         tokio::spawn(async move {
             let client = match crate::data::reseau::client_http() {
                 Ok(client) => client,
@@ -34,9 +39,16 @@ impl ConfigurationTelegram {
                 }
             };
 
-            while let Some(message) = rx.recv().await {
-                if let Err(erreur) = envoyer_message(&client, &self, &message).await {
-                    error!("Échec d'envoi de notification Telegram : {erreur}");
+            while let Some(commande) = rx.recv().await {
+                match commande {
+                    CommandeTelegram::Message(message) => {
+                        if let Err(erreur) = envoyer_message(&client, &self, &message).await {
+                            error!("Échec d'envoi de notification Telegram : {erreur}");
+                        }
+                    }
+                    CommandeTelegram::Attendre(reponse) => {
+                        let _ = reponse.send(());
+                    }
                 }
             }
         });
@@ -46,23 +58,32 @@ impl ConfigurationTelegram {
 
 #[derive(Clone)]
 pub struct NotificateurTelegram {
-    tx: mpsc::Sender<String>,
+    tx: mpsc::Sender<CommandeTelegram>,
 }
 
 impl NotificateurTelegram {
     /// Ajoute un message à la file sans attendre la réponse du service Telegram.
     ///
     /// Entrée : texte à transmettre.
-    /// Sortie : erreur si la file est pleine ou si le service d'envoi est arrêté.
-    pub fn notifier(&self, message: String) -> Result<(), String> {
-        self.tx.try_send(message).map_err(|erreur| match erreur {
-            mpsc::error::TrySendError::Full(_) => {
-                "La file des notifications Telegram est pleine.".into()
-            }
-            mpsc::error::TrySendError::Closed(_) => {
-                "Le service d'envoi Telegram est arrêté.".into()
-            }
-        })
+    /// Sortie : erreur si le service d'envoi est arrêté.
+    pub async fn notifier(&self, message: String) -> Result<(), String> {
+        self.tx
+            .send(CommandeTelegram::Message(message))
+            .await
+            .map_err(|_| "Le service d'envoi Telegram est arrêté.".into())
+    }
+
+    /// Attend le traitement des notifications déjà ajoutées à la file.
+    ///
+    /// Sortie : erreur si le service d'envoi s'arrête avant d'avoir vidé la file.
+    pub async fn attendre_envoi(&self) -> Result<(), String> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(CommandeTelegram::Attendre(tx))
+            .await
+            .map_err(|_| "Le service d'envoi Telegram est arrêté.".to_string())?;
+        rx.await
+            .map_err(|_| "Le service d'envoi Telegram s'est arrêté.".to_string())
     }
 }
 

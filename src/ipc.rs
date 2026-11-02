@@ -1,8 +1,10 @@
 use crate::config::Parametrages;
 use crate::data::sources::Fournisseur;
+use crate::data::telegram::NotificateurTelegram;
 use crate::ui::{CommandeMoteur, ModeExecution, NotificationMoteur, SignalVisuel};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
@@ -201,6 +203,7 @@ pub async fn servir(
     chemin_parametrages: PathBuf,
     mut rx_signaux: mpsc::Receiver<SignalVisuel>,
     mut rx_statut: mpsc::UnboundedReceiver<(u64, NotificationMoteur)>,
+    notificateur_telegram: Option<NotificateurTelegram>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let etat = Arc::new(RwLock::new(etat_initial));
     let (tx_evenements, _) = broadcast::channel(CAPACITE_DIFFUSION);
@@ -223,16 +226,31 @@ pub async fn servir(
                 let evenements_client = tx_evenements.clone();
                 let etat_client = Arc::clone(&etat);
                 let commandes_client = tx_commandes.clone();
+                let notificateur_client = notificateur_telegram.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
-                    gerer_client(
+                    let connectee = gerer_client(
                         stream,
+                        adresse,
                         jeton_client,
                         evenements_client,
                         etat_client,
                         commandes_client,
+                        notificateur_client.clone(),
                     )
                     .await;
+                    if connectee {
+                        info!("IHM déconnectée : {adresse}");
+                        if let Some(notificateur) = notificateur_client
+                            && let Err(erreur) = notificateur
+                                .notifier(format!("🔌 IHM déconnectée ({adresse})"))
+                                .await
+                        {
+                            tracing::error!(
+                                "Impossible d'envoyer la notification de déconnexion Telegram : {erreur}"
+                            );
+                        }
+                    }
                 });
             }
             signal = rx_signaux.recv() => {
@@ -357,15 +375,17 @@ pub async fn servir(
 
 /// Authentifie un client, puis relaie ses commandes et les événements du moteur.
 ///
-/// Entrées : connexion TCP, jeton attendu, diffuseur d'événements, état partagé et canal moteur.
-/// Sortie : ferme la connexion après déconnexion, erreur de protocole ou arrêt du moteur.
+/// Entrées : connexion TCP, adresse distante, jeton, diffuseur, état, commandes et notificateur.
+/// Sortie : `true` si le client a été authentifié, même s'il s'est ensuite déconnecté.
 async fn gerer_client(
     stream: TcpStream,
+    adresse: SocketAddr,
     jeton_attendu: Arc<str>,
     tx_evenements: broadcast::Sender<EvenementServeur>,
     etat: Arc<RwLock<EtatServeur>>,
     tx_commandes: mpsc::UnboundedSender<CommandeMoteur>,
-) {
+    notificateur_telegram: Option<NotificateurTelegram>,
+) -> bool {
     let (lecture, ecriture) = stream.into_split();
     let mut lecteur = BufReader::new(lecture);
     let mut ecrivain = BufWriter::new(ecriture);
@@ -389,7 +409,7 @@ async fn gerer_client(
         )
         .await;
         warn!("Authentification refusée");
-        return;
+        return false;
     }
 
     let etat_initial = etat.read().await.clone();
@@ -397,7 +417,15 @@ async fn gerer_client(
         ecrire_message(&mut ecrivain, &MessageServeur::Connecte(etat_initial)).await
     {
         warn!("Impossible d'envoyer l'état initial au client : {erreur}");
-        return;
+        return false;
+    }
+    info!("IHM authentifiée : {adresse}");
+    if let Some(notificateur) = &notificateur_telegram
+        && let Err(erreur) = notificateur
+            .notifier(format!("🖥 IHM connectée ({adresse})"))
+            .await
+    {
+        tracing::error!("Impossible d'envoyer la notification de connexion Telegram : {erreur}");
     }
     ligne.clear();
 
@@ -405,7 +433,7 @@ async fn gerer_client(
         tokio::select! {
             resultat = lire_ligne_limitee(&mut lecteur, &mut ligne) => {
                 match resultat {
-                    Ok(0) => return,
+                    Ok(0) => return true,
                     Ok(_) => {
                         match serde_json::from_str::<RequeteClient>(&ligne) {
                             Ok(RequeteClient::Commande(commande)) => {
@@ -414,23 +442,23 @@ async fn gerer_client(
                                         &mut ecrivain,
                                         &MessageServeur::Erreur("Le moteur est arrêté".to_string()),
                                     ).await;
-                                    return;
+                                    return true;
                                 }
                             }
                             Ok(RequeteClient::Authentifier { .. }) => {
                                 warn!("Nouvelle authentification ignorée sur une connexion active");
-                                return;
+                                return true;
                             }
                             Err(erreur) => {
                                 warn!("Commande reçue invalide : {erreur}");
-                                return;
+                                return true;
                             }
                         }
                         ligne.clear();
                     }
                     Err(erreur) => {
                         warn!("Erreur de lecture client : {erreur}");
-                        return;
+                        return true;
                     }
                 }
             }
@@ -442,13 +470,13 @@ async fn gerer_client(
                             &mut ecrivain,
                             &MessageServeur::Erreur("Le client ne suit plus le flux du moteur ; reconnectez l'IHM".to_string()),
                         ).await;
-                        return;
+                        return true;
                     }
-                    Err(broadcast::error::RecvError::Closed) => return,
+                    Err(broadcast::error::RecvError::Closed) => return true,
                 };
                 if let Err(erreur) = ecrire_message(&mut ecrivain, &message).await {
                     warn!("Erreur d'envoi au client : {erreur}");
-                    return;
+                    return true;
                 }
             }
         }
@@ -559,15 +587,17 @@ mod tests {
         let tx_evenements_serveur = tx_evenements.clone();
 
         let serveur = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
+            let (stream, adresse_client) = listener.accept().await.unwrap();
             gerer_client(
                 stream,
+                adresse_client,
                 Arc::clone(&jeton),
                 tx_evenements_serveur,
                 etat,
                 tx_commandes,
+                None,
             )
-            .await;
+            .await
         });
 
         let mut connexion = connecter(&adresse.to_string(), jeton_client).await.unwrap();
@@ -608,6 +638,11 @@ mod tests {
             }
         ));
         drop(connexion);
-        serveur.abort();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), serveur)
+                .await
+                .unwrap()
+                .unwrap()
+        );
     }
 }

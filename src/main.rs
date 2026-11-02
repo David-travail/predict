@@ -304,9 +304,14 @@ fn executer(_avec_arguments: bool) -> Result<(), Box<dyn std::error::Error>> {
     let chemin_parametrages = chemin_parametrages(arguments.config.as_ref());
     let parametrages = charger_parametrages(&config, &chemin_parametrages);
     let runtime = tokio::runtime::Runtime::new()?;
+    let notificateur_telegram = if arguments.local || arguments.console || arguments.serve {
+        let _runtime_guard = runtime.enter();
+        configuration_telegram(&config).map(ConfigurationCanalTelegram::demarrer)
+    } else {
+        None
+    };
 
     if arguments.local {
-        let configuration_telegram = configuration_telegram(&config);
         let (tx_ui, rx_ui) = mpsc::channel::<SignalVisuel>(256);
         let (tx_commandes, rx_commandes) = mpsc::unbounded_channel::<CommandeMoteur>();
         let (tx_statut, rx_statut) = mpsc::unbounded_channel::<(u64, NotificationMoteur)>();
@@ -325,7 +330,7 @@ fn executer(_avec_arguments: bool) -> Result<(), Box<dyn std::error::Error>> {
             tx_ui,
             tx_statut,
             rx_commandes,
-            configuration_telegram,
+            notificateur_telegram.clone(),
         ));
         let options = eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default().with_inner_size([900.0, 600.0]),
@@ -346,13 +351,13 @@ fn executer(_avec_arguments: bool) -> Result<(), Box<dyn std::error::Error>> {
                 ))
             }),
         );
+        notifier_arret_moteur(&runtime, notificateur_telegram.as_ref());
         runtime.shutdown_background();
         resultat?;
         return Ok(());
     }
 
     if arguments.console {
-        let configuration_telegram = configuration_telegram(&config);
         let (tx_ui, rx_ui) = mpsc::channel::<SignalVisuel>(256);
         let (tx_commandes, rx_commandes) = mpsc::unbounded_channel::<CommandeMoteur>();
         let (tx_statut, rx_statut) = mpsc::unbounded_channel::<(u64, NotificationMoteur)>();
@@ -372,16 +377,16 @@ fn executer(_avec_arguments: bool) -> Result<(), Box<dyn std::error::Error>> {
             tx_ui,
             tx_statut,
             rx_commandes,
-            configuration_telegram,
+            notificateur_telegram.clone(),
         ));
         let resultat = runtime.block_on(boucle_console(mode, rx_ui, rx_statut));
         drop(tx_commandes);
+        notifier_arret_moteur(&runtime, notificateur_telegram.as_ref());
         runtime.shutdown_background();
         return resultat.map_err(|erreur| std::io::Error::other(erreur.to_string()).into());
     }
 
     if arguments.serve {
-        let configuration_telegram = configuration_telegram(&config);
         let jeton = charger_jeton()?;
         let adresse = arguments
             .listen
@@ -417,7 +422,7 @@ fn executer(_avec_arguments: bool) -> Result<(), Box<dyn std::error::Error>> {
                 tx_ui,
                 tx_statut,
                 rx_commandes,
-                configuration_telegram,
+                notificateur_telegram.clone(),
             ));
             ipc::servir(
                 listener,
@@ -427,9 +432,11 @@ fn executer(_avec_arguments: bool) -> Result<(), Box<dyn std::error::Error>> {
                 chemin_parametrages,
                 rx_ui,
                 rx_statut,
+                notificateur_telegram.clone(),
             )
             .await
         });
+        notifier_arret_moteur(&runtime, notificateur_telegram.as_ref());
         runtime.shutdown_background();
         return resultat.map_err(|erreur| std::io::Error::other(erreur.to_string()).into());
     }
@@ -473,6 +480,24 @@ fn executer(_avec_arguments: bool) -> Result<(), Box<dyn std::error::Error>> {
 
     runtime.shutdown_background();
     Ok(())
+}
+
+fn notifier_arret_moteur(
+    runtime: &tokio::runtime::Runtime,
+    notificateur: Option<&NotificateurTelegram>,
+) {
+    let Some(notificateur) = notificateur else {
+        return;
+    };
+    runtime.block_on(async {
+        if let Err(erreur) = notificateur.notifier("🛑 Moteur arrêté.".into()).await {
+            error!("Impossible d'ajouter la notification d'arrêt Telegram : {erreur}");
+            return;
+        }
+        if let Err(erreur) = notificateur.attendre_envoi().await {
+            error!("Impossible d'attendre l'envoi de la notification d'arrêt Telegram : {erreur}");
+        }
+    });
 }
 
 /// Lit et valide le jeton partagé entre l'IHM et le moteur.
@@ -592,14 +617,8 @@ async fn moteur(
     tx_ui: mpsc::Sender<SignalVisuel>,
     tx_statut: mpsc::UnboundedSender<(u64, NotificationMoteur)>,
     mut rx_commandes: mpsc::UnboundedReceiver<CommandeMoteur>,
-    configuration_telegram: Option<ConfigurationCanalTelegram>,
+    notificateur: Option<NotificateurTelegram>,
 ) {
-    let notificateur = configuration_telegram.map(ConfigurationCanalTelegram::demarrer);
-    if let Some(notificateur) = &notificateur
-        && let Err(erreur) = notificateur.notifier("✅ Moteur Predict démarré.".into())
-    {
-        error!("{erreur}");
-    }
     let mut session: Option<JoinHandle<()>> = None;
 
     while let Some(commande) = rx_commandes.recv().await {
@@ -620,6 +639,14 @@ async fn moteur(
         else {
             continue;
         };
+
+        if let Some(notificateur) = &notificateur
+            && let Err(erreur) = notificateur
+                .notifier(format!("🚀 Moteur démarré\nMode : {}", libelle_mode(mode)))
+                .await
+        {
+            error!("Impossible d'envoyer la notification de démarrage : {erreur}");
+        }
 
         let ctx = Contexte {
             config: Arc::clone(&config),
@@ -1152,15 +1179,15 @@ impl Contexte {
         if !rejeu && bougie.cloturee {
             if let Some(notificateur) = &self.notificateur {
                 let mut tendances = self.dernieres_tendances.lock().await;
-                let precedente = tendances.insert(signal.symbole.clone(), signal.tendance);
-                let direction = tendance_notifiable(precedente, signal.tendance);
+                let direction =
+                    detecter_retournement(&mut tendances, &signal.symbole, signal.tendance);
                 if let Some(direction) = direction {
                     let message = format!(
-                        "Tendance en {direction}\nPaire : {}\nPériode : {}\nPrix : {:.8}\nScore : {}/100\nHeure : {}",
+                        "🔄 Retournement de tendance en {direction}\nPaire : {}\nPériode : {}\nPrix : {:.8}\nScore : {}/100\nHeure : {}",
                         signal.symbole, signal.unite, signal.prix, signal.score, signal.horodatage
                     );
-                    if let Err(erreur) = notificateur.notifier(message) {
-                        error!("{erreur}");
+                    if let Err(erreur) = notificateur.notifier(message).await {
+                        error!("Impossible d'envoyer l'alerte de retournement Telegram : {erreur}");
                     }
                 }
             }
@@ -1174,14 +1201,14 @@ impl Contexte {
         tendances.clear();
         for historique in historiques.values() {
             if let Some(derniere) = historique.last() {
-                tendances.insert(
-                    derniere.symbole.to_uppercase(),
-                    calculer_tendance(
-                        historique,
-                        derniere,
-                        self.parametrages.resoudre(&derniere.symbole),
-                    ),
+                let tendance = calculer_tendance(
+                    historique,
+                    derniere,
+                    self.parametrages.resoudre(&derniere.symbole),
                 );
+                if tendance != Tendance::Neutre {
+                    tendances.insert(derniere.symbole.to_uppercase(), tendance);
+                }
             }
         }
     }
@@ -1352,11 +1379,28 @@ fn calculer_tendance(
     }
 }
 
-fn tendance_notifiable(precedente: Option<Tendance>, courante: Tendance) -> Option<&'static str> {
-    match courante {
-        Tendance::Haussiere if precedente != Some(courante) => Some("hausse 📈"),
-        Tendance::Baissiere if precedente != Some(courante) => Some("baisse 📉"),
-        Tendance::Haussiere | Tendance::Baissiere | Tendance::Neutre => None,
+fn detecter_retournement(
+    dernieres_tendances: &mut HashMap<String, Tendance>,
+    symbole: &str,
+    courante: Tendance,
+) -> Option<&'static str> {
+    if courante == Tendance::Neutre {
+        return None;
+    }
+    let precedente = dernieres_tendances.insert(symbole.to_uppercase(), courante);
+    match (precedente, courante) {
+        (Some(Tendance::Haussiere), Tendance::Baissiere) => Some("baisse 📉"),
+        (Some(Tendance::Baissiere), Tendance::Haussiere) => Some("hausse 📈"),
+        _ => None,
+    }
+}
+
+fn libelle_mode(mode: ModeExecution) -> &'static str {
+    match mode {
+        ModeExecution::TempsReel => "temps réel",
+        ModeExecution::Simulation => "simulation",
+        ModeExecution::BacktestPeriode => "rejeu par période",
+        ModeExecution::BacktestFichier => "rejeu de fichier",
     }
 }
 
@@ -1427,21 +1471,30 @@ mod tests {
     }
 
     #[test]
-    fn notifie_uniquement_les_changements_vers_une_tendance_directionnelle() {
+    fn detecte_les_retournements_independamment_par_symbole() {
+        let mut tendances = HashMap::new();
         assert_eq!(
-            tendance_notifiable(None, Tendance::Haussiere),
+            detecter_retournement(&mut tendances, "BTCEUR", Tendance::Haussiere),
+            None
+        );
+        assert_eq!(
+            detecter_retournement(&mut tendances, "ETHEUR", Tendance::Baissiere),
+            None
+        );
+        assert_eq!(
+            detecter_retournement(&mut tendances, "BTCEUR", Tendance::Haussiere),
+            None
+        );
+        assert_eq!(
+            detecter_retournement(&mut tendances, "ETHEUR", Tendance::Neutre),
+            None
+        );
+        assert_eq!(
+            detecter_retournement(&mut tendances, "ETHEUR", Tendance::Haussiere),
             Some("hausse 📈")
         );
         assert_eq!(
-            tendance_notifiable(Some(Tendance::Haussiere), Tendance::Haussiere),
-            None
-        );
-        assert_eq!(
-            tendance_notifiable(Some(Tendance::Haussiere), Tendance::Neutre),
-            None
-        );
-        assert_eq!(
-            tendance_notifiable(Some(Tendance::Haussiere), Tendance::Baissiere),
+            detecter_retournement(&mut tendances, "BTCEUR", Tendance::Baissiere),
             Some("baisse 📉")
         );
     }
