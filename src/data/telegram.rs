@@ -1,7 +1,7 @@
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
-use tracing::error;
+use tracing::{error, info};
 
 const CAPACITE_FILE: usize = 32;
 const LONGUEUR_MAX_EXTRAIT: usize = 500;
@@ -83,6 +83,10 @@ async fn envoyer_message(
     configuration: &ConfigurationTelegram,
     message: &str,
 ) -> Result<(), String> {
+    info!(
+        "Envoi Telegram vers chat {} : {}",
+        configuration.identifiant_chat, message
+    );
     let url = format!(
         "https://api.telegram.org/bot{}/sendMessage",
         configuration.jeton_bot

@@ -376,9 +376,15 @@ fn lire_texte<'a>(valeur: &'a Value, cle: &str) -> Result<&'a str, Box<dyn Error
 /// Entrées : objet JSON et nom du champ.
 /// Sortie : valeur `f64` ou erreur si le champ est absent ou invalide.
 fn decimal(valeur: &Value, cle: &str) -> Result<f64, Box<dyn Error>> {
-    lire_texte(valeur, cle)?
-        .parse()
-        .map_err(|erreur| format!("Champ Kraken '{cle}' invalide : {erreur}").into())
+    match valeur.get(cle) {
+        Some(Value::Number(nombre)) => nombre
+            .as_f64()
+            .ok_or_else(|| format!("Champ Kraken '{cle}' invalide").into()),
+        Some(Value::String(texte)) => texte
+            .parse()
+            .map_err(|erreur| format!("Champ Kraken '{cle}' invalide : {erreur}").into()),
+        _ => Err(format!("Champ Kraken '{cle}' absent ou invalide").into()),
+    }
 }
 
 /// Convertit une valeur décimale REST Kraken représentée sous forme de texte.
@@ -406,16 +412,21 @@ mod tests {
             "data": [{
                 "symbol": "BTC/EUR",
                 "interval_begin": "2026-10-28T09:00:00.000000Z",
-                "open": "100",
-                "high": "110",
-                "low": "95",
-                "close": "105",
-                "volume": "12.5"
+                "open": 100.0,
+                "high": 110.0,
+                "low": 95.0,
+                "close": 105.0,
+                "volume": 12.5
             }]
         });
         let resultat = analyser_messages(&message.to_string(), "1h").unwrap();
         assert_eq!(resultat[0].0, "BTCEUR");
         assert_eq!(resultat[0].1.volume, 12.5);
+    }
+
+    #[test]
+    fn accepte_les_decimaux_kraken_sous_forme_de_texte() {
+        assert_eq!(decimal(&json!({"open": "100.5"}), "open").unwrap(), 100.5);
     }
 
     #[test]

@@ -291,6 +291,14 @@ fn executer(_avec_arguments: bool) -> Result<(), Box<dyn std::error::Error>> {
 
     // 2. Paramètres et démarrage
     info!("Paires surveillées : {:?}", config.paires.symboles);
+    if config.telegram.jeton_bot.trim().is_empty() {
+        info!("Configuration Telegram : désactivée");
+    } else {
+        info!(
+            "Configuration Telegram : activée (bot_token=[masqué], chat_id={})",
+            config.telegram.identifiant_chat.trim()
+        );
+    }
     crate::data::reseau::definir_proxy(config.reseau.proxy.clone());
 
     let chemin_parametrages = chemin_parametrages(arguments.config.as_ref());
