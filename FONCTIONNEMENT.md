@@ -62,6 +62,15 @@ Le fichier de configuration pouvant contenir le secret du bot, ne pas versionner
 
 - Le serveur exige le même secret dans la variable d'environnement `PREDICT_TOKEN` côté moteur et côté IHM (au moins 16 caractères). Les messages sont échangés en TCP/JSON ; le trafic n'est pas chiffré, donc utiliser un réseau privé de confiance ou un VPN.
 - Les notifications de connexion/déconnexion ne sont émises qu'après authentification réussie de l'IHM ; un refus ou une connexion TCP incomplète n'est pas signalé comme une session IHM.
+- **Connexion distante moteur–IHM (`src/ipc.rs`)** :
+  1. Démarrer le moteur avec `predict --serve`, puis lancer l'IHM avec `predict` (connexion locale) ou `predict --connect <IP>:8765`. Les deux processus doivent disposer du même `PREDICT_TOKEN`.
+  2. L'IHM ouvre une connexion TCP et envoie d'abord une requête JSON terminée par un retour à la ligne, contenant le jeton. Le moteur attend cette authentification au maximum 10 secondes ; un jeton incorrect ou un délai dépassé entraîne un refus. Le serveur accepte au plus 32 clients simultanés et limite chaque message à 1 Mio.
+  3. Après authentification, le moteur répond avec l'état courant : paires suivies, paramètres, fournisseurs activés, mode et génération actifs, signaux déjà calculés et éventuel statut. L'IHM initialise son affichage à partir de cet instantané.
+  4. Ensuite, les échanges sont bidirectionnels, sous forme de messages JSON séparés par des retours à la ligne. L'IHM envoie les commandes `Demarrer`, `Arreter` ou `SauvegarderParametrages` ; le serveur les relaie au moteur (la sauvegarde est effectuée sur la machine du moteur). Le moteur diffuse vers les IHM connectées les signaux calculés et les notifications de statut ou d'erreur.
+  5. Chaque redémarrage de traitement incrémente la génération ; l'IHM ignore les signaux d'une génération antérieure. Si la connexion tombe, l'IHM signale la perte de liaison ; elle doit être relancée pour se reconnecter et recevoir un nouvel état initial. La déconnexion d'une IHM n'arrête pas le moteur serveur.
+
+  Le jeton étant transmis sur une liaison TCP non chiffrée, ne pas exposer le port sur un réseau non fiable ; utiliser un réseau privé ou un VPN.
+- En mode `predict --local`, le moteur et l'IHM échangent les mêmes types de commandes, signaux et statuts par des canaux internes au processus, sans TCP ni authentification.
 - « Sauvegarder » écrit les paramétrages sur la machine du moteur ; ils seront rechargés au prochain démarrage du serveur.
 - `predict --console` reste disponible pour une analyse console autonome (sans serveur ni IHM).
 - Les signaux et statuts du moteur sont transmis à l'IHM ; les erreurs des sources sont journalisées et affichées dans une boîte de dialogue ; la barre d'état du temps réel n'affiche que les noms des flux actifs.
@@ -141,7 +150,7 @@ IHM egui (update) ◄──canal SignalVisuel (256)─────────�
 2. **Bougie clôturée** : ajoutée à l'historique (max 300 bougies), analyse sur cet historique.
    **Bougie en cours** : analyse sur une copie `historique + bougie`, sans modifier l'historique.
 3. `construire_signal` calcule EMA / Supertrend / ADX / volume, le score et l'alerte (voir §1) et fabrique un `SignalVisuel`.
-4. Le signal est envoyé à l'IHM ; si l'IHM est fermée, la session s'arrête.
+4. Le signal est envoyé à l'IHM. En mode `--local`, fermer l'IHM arrête également le moteur ; en mode serveur `--serve`, la fermeture de l'IHM distante ne coupe pas le traitement.
 
 ### Étape 3 – Affichage (`ui.rs`, `update`, rappelée en continu)
 1. Les signaux sont lus dans le canal ; ceux dont la `generation` ne correspond pas à la session courante (ancien mode) sont jetés.
