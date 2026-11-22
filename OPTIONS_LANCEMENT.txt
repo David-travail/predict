@@ -5,6 +5,7 @@ Serveur moteur et interface graphique séparés
 ---------------------------------------------
   1. Dans la console du moteur, définir le même jeton secret que pour l'IHM :
         $env:PREDICT_TOKEN = "votre-jeton-secret-de-16-caracteres-minimum"
+        export PREDICT_TOKEN="votre-jeton-secret-de-16-caracteres-minimum"
         .\predict.exe --serve
         Ou avec Cargo, depuis le dossier du projet :
            cargo run -- --serve
@@ -24,12 +25,29 @@ Serveur moteur et interface graphique séparés
      L'IHM se connecte par défaut à 127.0.0.1:8765.
      Pour un moteur sur un autre ordinateur :
            $env:PREDICT_TOKEN = "le-meme-jeton-secret"
+           export PREDICT_TOKEN="le-meme-jeton-secret"
            .\predict.exe --connect 192.168.1.10:8765
      Avec Cargo :
            cargo run -- --connect 192.168.1.10:8765
 
   L'IHM peut changer de mode et piloter le moteur. Fermer l'IHM ne l'arrête pas ;
   seul Ctrl+C dans la console du serveur arrête le moteur.
+
+Serveur détaché sur le Raspberry Pi (serveur.sh)
+------------------------------------------------
+  Placer serveur.sh à côté de l'exécutable predict (ou dans le dossier du projet
+  après cargo build --release), puis une seule fois :
+        echo "votre-jeton-secret-de-16-caracteres-minimum" > .predict_token
+        chmod 600 .predict_token
+
+  ./serveur.sh              Démarre le serveur en arrière-plan ; la fenêtre ou la
+                            session SSH peut ensuite être fermée
+  ./serveur.sh statut       Indique si le serveur tourne (PID, durée, CPU, mémoire)
+  ./serveur.sh journal      Suit la sortie console (Ctrl+C quitte le suivi seulement)
+  ./serveur.sh arreter      Arrêt propre (équivalent de Ctrl+C)
+  ./serveur.sh redemarrer   Arrête puis redémarre
+
+  Adresse d'écoute personnalisée : PREDICT_LISTEN=0.0.0.0:9000 ./serveur.sh
 
 Mode local : moteur et IHM ensemble
 -----------------------------------
@@ -86,3 +104,20 @@ Remarques
   - Les modes periode et fichier se terminent seuls ; le code de sortie est
     différent de 0 en cas d'erreur.
   - L'IHM nécessite qu'un serveur soit déjà démarré et que PREDICT_TOKEN soit défini.
+
+Notifications Telegram (moteur)
+-------------------------------
+  Le jeton du bot ne doit pas être versionné. Créer à côté de config.toml un fichier
+  .telegram.toml (ignoré par git), puis chmod 600 .telegram.toml :
+        [telegram]
+        bot_token = "123456:ABC..."
+        chat_id = "123456789"
+  Ou définir les variables PREDICT_TELEGRAM_TOKEN et PREDICT_TELEGRAM_CHAT_ID
+  (prioritaires sur le fichier).
+
+Lancer l'IHM sur macOS (ihm.sh / Predict IHM.app)
+-------------------------------------------------
+  Double-cliquer sur « Predict IHM.app » (dans le dossier du projet), ou :
+        ./ihm.sh                     adresse de .predict_connect, sinon 127.0.0.1:8765
+        ./ihm.sh 192.168.1.128:8765  moteur indiqué
+  Jeton : PREDICT_TOKEN ou fichier .predict_token. Sortie : predict-ihm.log.

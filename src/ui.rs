@@ -18,6 +18,8 @@ pub enum ModeExecution {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum NotificationMoteur {
     Statut(String),
+    /// Message ponctuel (ex. sauvegarde) qui ne remplace pas le statut du mode en cours.
+    Info(String),
     Erreur(String),
     Echec(String),
 }
@@ -223,9 +225,16 @@ pub struct ApplicationCryptobot {
     /// Paramètres de calcul modifiables ; envoyés au moteur à chaque (re)lancement.
     pub parametrages: Parametrages,
     fournisseurs: Vec<Fournisseur>,
-    /// Portée (générique, bloc ou paire) actuellement éditée.
+    /// Paramétrages tels qu'ils ont été sauvegardés pour la dernière fois.
+    parametrages_sauvegardes: Parametrages,
+    /// Portée (défaut ou paire) actuellement éditée dans la barre de paramètres.
     portee: Portee,
-    symboles: Vec<String>,
+    /// Réglage copié, prêt à être collé sur une paire (libellé de la source, réglage).
+    presse_papiers: Option<(String, ConfigurationStrategie)>,
+    /// Fenêtre « Copier vers… » ouverte, avec les paires cochées.
+    copie_vers: Option<HashSet<String>>,
+    /// Dernier message concernant les réglages (copie, sauvegarde…).
+    message_reglages: String,
     symboles_test_disponibles: Vec<String>,
     symboles_test: HashSet<String>,
     pub generation: u64,
@@ -237,6 +246,8 @@ pub struct ApplicationCryptobot {
     dernier_message: Option<Instant>,
     tx_commandes: Option<UnboundedSender<CommandeMoteur>>,
     rx_statut: Option<UnboundedReceiver<(u64, NotificationMoteur)>>,
+    /// Dernière occupation CPU/mémoire publiée par le serveur.
+    rx_ressources: Option<tokio::sync::watch::Receiver<Option<crate::ipc::RessourcesServeur>>>,
     erreur_dialogue: Option<String>,
 }
 
@@ -253,9 +264,6 @@ impl ApplicationCryptobot {
     ) -> Self {
         let mut symboles_test_disponibles = symboles.clone();
         symboles_test_disponibles.extend(parametrages.paires.keys().cloned());
-        for groupe in parametrages.groupes.values() {
-            symboles_test_disponibles.extend(groupe.symboles.iter().cloned());
-        }
         symboles_test_disponibles = symboles_test_disponibles
             .into_iter()
             .map(|s| s.to_uppercase())
@@ -264,11 +272,14 @@ impl ApplicationCryptobot {
         symboles_test_disponibles.dedup();
 
         Self {
+            parametrages_sauvegardes: parametrages.clone(),
             parametrages,
             fournisseurs,
             portee: Portee::Generique,
+            presse_papiers: None,
+            copie_vers: None,
+            message_reglages: String::new(),
             symboles_test: symboles.iter().map(|s| s.to_uppercase()).collect(),
-            symboles,
             symboles_test_disponibles,
             rx_mpsc,
             paires: HashMap::new(),
@@ -288,6 +299,7 @@ impl ApplicationCryptobot {
             dernier_message: None,
             tx_commandes: None,
             rx_statut: None,
+            rx_ressources: None,
             erreur_dialogue: None,
         }
     }
@@ -303,6 +315,18 @@ impl ApplicationCryptobot {
     ) -> Self {
         self.tx_commandes = Some(tx_commandes);
         self.rx_statut = Some(rx_statut);
+        self
+    }
+
+    /// Branche l'affichage de l'occupation CPU/mémoire du serveur.
+    ///
+    /// Entrées : récepteur des mesures périodiques envoyées par le serveur.
+    /// Sortie : application configurée, renvoyée pour chaînage.
+    pub fn avec_ressources(
+        mut self,
+        rx_ressources: tokio::sync::watch::Receiver<Option<crate::ipc::RessourcesServeur>>,
+    ) -> Self {
+        self.rx_ressources = Some(rx_ressources);
         self
     }
 
@@ -329,6 +353,7 @@ impl ApplicationCryptobot {
             if generation_statut == generation {
                 match notification {
                     NotificationMoteur::Statut(texte) => self.statut = texte,
+                    NotificationMoteur::Info(texte) => self.message_reglages = texte,
                     NotificationMoteur::Erreur(texte) | NotificationMoteur::Echec(texte) => {
                         self.erreur_dialogue = Some(texte);
                     }
@@ -405,6 +430,75 @@ impl ApplicationCryptobot {
             parametrages: self.parametrages.clone(),
             fournisseurs: self.fournisseurs.clone(),
         });
+    }
+
+    /// Exécute une action sur les réglages (copie, collage, retour au défaut, sauvegarde).
+    ///
+    /// Entrée : action demandée depuis la barre de paramètres ou une carte de paire.
+    /// Sortie : met à jour les paramétrages, le presse-papiers et le message affiché.
+    fn executer_action_reglages(&mut self, action: ActionReglages) {
+        match action {
+            ActionReglages::Copier(portee) => {
+                let libelle = libelle_portee(&portee);
+                self.presse_papiers = Some((libelle.clone(), self.parametrages.lire(&portee)));
+                self.message_reglages = format!("📋 Réglages « {libelle} » copiés.");
+            }
+            ActionReglages::Coller(portee) => {
+                if let Some((source, reglage)) = self.presse_papiers.clone() {
+                    self.parametrages.ecrire(&portee, reglage);
+                    self.message_reglages = format!(
+                        "📥 Réglages « {source} » collés sur « {} ».",
+                        libelle_portee(&portee)
+                    );
+                }
+            }
+            ActionReglages::CopierVers(source, cibles) => {
+                self.parametrages.copier(&source, &cibles);
+                self.message_reglages = format!(
+                    "⇉ Réglages « {} » copiés vers {} paire(s).",
+                    libelle_portee(&source),
+                    cibles.len()
+                );
+            }
+            ActionReglages::RevenirAuDefaut(portee) => {
+                self.parametrages.reinitialiser(&portee);
+                self.message_reglages = format!(
+                    "↺ « {} » suit de nouveau le défaut.",
+                    libelle_portee(&portee)
+                );
+            }
+            ActionReglages::Sauvegarder => {
+                if let Err(erreur) = self.parametrages.valider() {
+                    self.erreur_dialogue = Some(format!("Réglages invalides : {erreur}"));
+                    return;
+                }
+                self.message_reglages = "Sauvegarde en cours...".to_string();
+                self.parametrages_sauvegardes = self.parametrages.clone();
+                self.envoyer(CommandeMoteur::SauvegarderParametrages {
+                    parametrages: self.parametrages.clone(),
+                });
+            }
+        }
+    }
+}
+
+/// Action demandée sur les réglages des indicateurs.
+enum ActionReglages {
+    Copier(Portee),
+    Coller(Portee),
+    CopierVers(Portee, Vec<String>),
+    RevenirAuDefaut(Portee),
+    Sauvegarder,
+}
+
+/// Libellé affiché pour une portée de réglage.
+///
+/// Entrée : portée.
+/// Sortie : « Défaut » ou le symbole de la paire.
+fn libelle_portee(portee: &Portee) -> String {
+    match portee {
+        Portee::Generique => "Défaut".to_string(),
+        Portee::Paire(symbole) => symbole.clone(),
     }
 }
 
@@ -561,6 +655,25 @@ fn editeur_indicateurs(
     );
 }
 
+/// Formate l'occupation du serveur pour l'en-tête (ex. « 🖥 Serveur : CPU 1.2 % · RAM 48 Mo (0.3 %) »).
+fn texte_ressources(r: &crate::ipc::RessourcesServeur) -> String {
+    let memoire_mo = r.memoire_octets as f64 / (1024.0 * 1024.0);
+    let memoire = if memoire_mo >= 1024.0 {
+        format!("{:.2} Go", memoire_mo / 1024.0)
+    } else {
+        format!("{memoire_mo:.0} Mo")
+    };
+    let part = if r.memoire_totale_octets > 0 {
+        format!(
+            " ({:.1} %)",
+            r.memoire_octets as f64 * 100.0 / r.memoire_totale_octets as f64
+        )
+    } else {
+        String::new()
+    };
+    format!("🖥 Serveur : CPU {:.1} % · RAM {memoire}{part}", r.cpu_pourcent)
+}
+
 impl eframe::App for ApplicationCryptobot {
     /// Dessine l'interface et traite les signaux, statuts et interactions utilisateur.
     ///
@@ -592,6 +705,7 @@ impl eframe::App for ApplicationCryptobot {
                 if generation == self.generation {
                     match notification {
                         NotificationMoteur::Statut(texte) => self.statut = texte,
+                        NotificationMoteur::Info(texte) => self.message_reglages = texte,
                         NotificationMoteur::Erreur(texte) | NotificationMoteur::Echec(texte) => {
                             if let Some(erreur) = &mut self.erreur_dialogue {
                                 erreur.push('\n');
@@ -805,101 +919,166 @@ impl eframe::App for ApplicationCryptobot {
 
             // Paramètres de calcul : appliqués par « Appliquer » (relance le mode courant)
             ui.separator();
-            let mut sauvegarder = false;
-            let mut heriter = false;
-            let mut propager = false;
+            let mut actions: Vec<ActionReglages> = Vec::new();
             ui.horizontal_wrapped(|ui| {
-                ui.label("Paramétrage :");
-                let libelle = |p: &Portee| match p {
-                    Portee::Generique => "Générique".to_string(),
-                    Portee::Groupe(nom) => format!("Bloc {nom}"),
-                    Portee::Paire(symbole) => format!("Paire {symbole}"),
-                };
+                ui.label("Réglages :");
                 egui::ComboBox::from_id_salt("portee")
-                    .selected_text(libelle(&self.portee))
+                    .selected_text(libelle_portee(&self.portee))
                     .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.portee, Portee::Generique, "Générique");
-                        for nom in self.parametrages.groupes.keys() {
-                            let p = Portee::Groupe(nom.clone());
-                            let texte = libelle(&p);
-                            ui.selectable_value(&mut self.portee, p, texte);
-                        }
-                        for symbole in &self.symboles {
-                            let p = Portee::Paire(symbole.to_uppercase());
-                            let texte = libelle(&p);
-                            ui.selectable_value(&mut self.portee, p, texte);
+                        ui.selectable_value(&mut self.portee, Portee::Generique, "Défaut")
+                            .on_hover_text("S'applique aux paires sans réglage propre");
+                        for symbole in &self.symboles_test_disponibles {
+                            let propre = self.parametrages.paires.contains_key(symbole);
+                            let texte = if propre {
+                                format!("{symbole} ★")
+                            } else {
+                                symbole.clone()
+                            };
+                            ui.selectable_value(
+                                &mut self.portee,
+                                Portee::Paire(symbole.clone()),
+                                texte,
+                            );
                         }
                     });
-                if self.portee != Portee::Generique {
+                if matches!(self.portee, Portee::Paire(_)) {
                     let propre = self.parametrages.a_un_reglage_propre(&self.portee);
                     ui.label(if propre {
-                        "(réglage propre)"
+                        "(réglage propre ★)"
                     } else {
-                        "(hérité)"
+                        "(suit le défaut)"
                     });
                     if ui
-                        .add_enabled(propre, egui::Button::new("↺ Hériter"))
+                        .add_enabled(propre, egui::Button::new("↺ Revenir au défaut"))
                         .clicked()
                     {
-                        heriter = true;
+                        actions.push(ActionReglages::RevenirAuDefaut(self.portee.clone()));
                     }
                 }
-                if !matches!(self.portee, Portee::Paire(_)) {
-                    if ui
-                        .button("⇊ Copier vers les paires")
-                        .on_hover_text("Écrase le réglage propre des paires concernées")
-                        .clicked()
-                    {
-                        propager = true;
-                    }
+                ui.separator();
+                if ui
+                    .button("📋 Copier")
+                    .on_hover_text("Copie ces réglages pour les coller sur une autre paire")
+                    .clicked()
+                {
+                    actions.push(ActionReglages::Copier(self.portee.clone()));
                 }
-                if ui.button("💾 Sauvegarder").clicked() {
-                    sauvegarder = true;
+                let collage_possible = self.presse_papiers.is_some();
+                let texte_coller = match &self.presse_papiers {
+                    Some((source, _)) => format!("📥 Coller « {source} »"),
+                    None => "📥 Coller".to_string(),
+                };
+                if ui
+                    .add_enabled(collage_possible, egui::Button::new(texte_coller))
+                    .clicked()
+                {
+                    actions.push(ActionReglages::Coller(self.portee.clone()));
+                }
+                if ui
+                    .button("⇉ Copier vers…")
+                    .on_hover_text("Copie ces réglages vers plusieurs paires")
+                    .clicked()
+                {
+                    self.copie_vers = Some(HashSet::new());
+                }
+                ui.separator();
+                let non_sauvegarde = self.parametrages != self.parametrages_sauvegardes;
+                if ui
+                    .button(if non_sauvegarde {
+                        "💾 Sauvegarder *"
+                    } else {
+                        "💾 Sauvegarder"
+                    })
+                    .on_hover_text(
+                        "Écrit les réglages dans parametres.toml (rechargés au démarrage)",
+                    )
+                    .clicked()
+                {
+                    actions.push(ActionReglages::Sauvegarder);
+                }
+                if non_sauvegarde {
+                    ui.label(
+                        egui::RichText::new("● modifications non sauvegardées")
+                            .color(egui::Color32::from_rgb(200, 120, 0)),
+                    );
+                } else if !self.message_reglages.is_empty() {
+                    ui.label(
+                        egui::RichText::new(&self.message_reglages).color(egui::Color32::GRAY),
+                    );
                 }
             });
-            if heriter {
-                self.parametrages.reinitialiser(&self.portee);
-            }
-            if propager {
-                self.parametrages.propager(&self.portee, &self.symboles);
-            }
-            if sauvegarder {
-                self.statut = "Sauvegarde des paramétrages sur le moteur...".to_string();
-                self.envoyer(CommandeMoteur::SauvegarderParametrages {
-                    parametrages: self.parametrages.clone(),
-                });
-            }
 
             let mut s = self.parametrages.lire(&self.portee);
             let avant = s.clone();
-            let bloc_vertical = matches!(self.portee, Portee::Groupe(_));
-            if bloc_vertical {
-                ui.vertical(|ui| {
-                    ui.add(
-                        egui::Slider::new(&mut s.score_min_alerte, 0..=100).text("Seuil d'alerte"),
-                    );
-                    editeur_indicateurs(ui, &mut s, true);
-                    if ui.button("✔ Appliquer").clicked() {
-                        lancer_test = true;
-                    }
-                });
-            } else {
-                ui.horizontal_wrapped(|ui| {
-                    ui.add(
-                        egui::Slider::new(&mut s.score_min_alerte, 0..=100).text("Seuil d'alerte"),
-                    );
-                    ui.separator();
-                    editeur_indicateurs(ui, &mut s, false);
-                    ui.separator();
-                    if ui.button("✔ Appliquer").clicked() {
-                        lancer_test = true;
-                    }
-                });
-            }
+            ui.horizontal_wrapped(|ui| {
+                ui.add(egui::Slider::new(&mut s.score_min_alerte, 0..=100).text("Seuil d'alerte"));
+                ui.separator();
+                editeur_indicateurs(ui, &mut s, false);
+                ui.separator();
+                if ui
+                    .button("✔ Appliquer")
+                    .on_hover_text("Relance l'analyse avec ces réglages")
+                    .clicked()
+                {
+                    lancer_test = true;
+                }
+            });
             if s != avant {
                 self.parametrages.ecrire(&self.portee, s);
             }
+            for action in actions {
+                self.executer_action_reglages(action);
+            }
         });
+
+        // Fenêtre « Copier vers… » : choix des paires qui reçoivent les réglages de la portée éditée.
+        if let Some(mut cibles) = self.copie_vers.take() {
+            let mut ouverte = true;
+            let mut valider = false;
+            let source = self.portee.clone();
+            egui::Window::new(format!("Copier « {} » vers…", libelle_portee(&source)))
+                .id(egui::Id::new("copie_vers"))
+                .open(&mut ouverte)
+                .collapsible(false)
+                .resizable(false)
+                .show(&ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui.small_button("Tout cocher").clicked() {
+                            cibles.extend(self.symboles_test_disponibles.iter().cloned());
+                        }
+                        if ui.small_button("Aucune").clicked() {
+                            cibles.clear();
+                        }
+                    });
+                    for symbole in &self.symboles_test_disponibles {
+                        if source == Portee::Paire(symbole.clone()) {
+                            continue;
+                        }
+                        let mut coche = cibles.contains(symbole);
+                        if ui.checkbox(&mut coche, formater_paire(symbole)).changed() {
+                            if coche {
+                                cibles.insert(symbole.clone());
+                            } else {
+                                cibles.remove(symbole);
+                            }
+                        }
+                    }
+                    ui.separator();
+                    if ui
+                        .add_enabled(!cibles.is_empty(), egui::Button::new("⇉ Copier"))
+                        .clicked()
+                    {
+                        valider = true;
+                    }
+                });
+            if valider {
+                let mut liste: Vec<String> = cibles.into_iter().collect();
+                liste.sort_unstable();
+                self.executer_action_reglages(ActionReglages::CopierVers(source, liste));
+            } else if ouverte {
+                self.copie_vers = Some(cibles);
+            }
+        }
 
         afficher_calendrier(
             &ctx,
@@ -999,7 +1178,16 @@ impl eframe::App for ApplicationCryptobot {
 
         // 4. PANNEAU CENTRAL : Grille des cartes par paire
         egui::CentralPanel::default().show(ui, |ui| {
-            ui.heading("📊 Paires Surveillées en Temps Réel");
+            ui.horizontal(|ui| {
+                ui.heading("📊 Paires Surveillées en Temps Réel");
+                let ressources = self.rx_ressources.as_ref().and_then(|rx| *rx.borrow());
+                if let Some(r) = ressources {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(texte_ressources(&r))
+                            .on_hover_text("Occupation du processus serveur (mise à jour toutes les 2 s)");
+                    });
+                }
+            });
             if !self.statut.is_empty() {
                 ui.label(
                     egui::RichText::new(&self.statut).color(egui::Color32::from_rgb(90, 60, 0)),
@@ -1010,6 +1198,8 @@ impl eframe::App for ApplicationCryptobot {
             let mut retour_direct = false;
             let mut appliquer = false;
             let mut modifications: Vec<(String, ConfigurationStrategie)> = Vec::new();
+            let mut actions: Vec<ActionReglages> = Vec::new();
+            let presse_papiers = self.presse_papiers.as_ref().map(|(source, _)| source.clone());
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     for (symbole, signal_courant) in &self.paires {
@@ -1176,9 +1366,49 @@ impl eframe::App for ApplicationCryptobot {
                                         .animate(signal.est_alerte),
                                 );
 
-                                egui::CollapsingHeader::new("⚙ Paramètres de la paire")
+                                let portee = Portee::Paire(symbole.clone());
+                                let propre = self.parametrages.a_un_reglage_propre(&portee);
+                                egui::CollapsingHeader::new(if propre {
+                                    "⚙ Paramètres de la paire ★"
+                                } else {
+                                    "⚙ Paramètres de la paire (défaut)"
+                                })
                                     .id_salt(("params", symbole))
                                     .show(ui, |ui| {
+                                        ui.horizontal_wrapped(|ui| {
+                                            if ui
+                                                .small_button("📋 Copier")
+                                                .on_hover_text("Copie les réglages de cette paire")
+                                                .clicked()
+                                            {
+                                                actions.push(ActionReglages::Copier(portee.clone()));
+                                            }
+                                            let texte = match &presse_papiers {
+                                                Some(source) => format!("📥 Coller « {source} »"),
+                                                None => "📥 Coller".to_string(),
+                                            };
+                                            if ui
+                                                .add_enabled(
+                                                    presse_papiers.is_some(),
+                                                    egui::Button::new(texte).small(),
+                                                )
+                                                .clicked()
+                                            {
+                                                actions.push(ActionReglages::Coller(portee.clone()));
+                                            }
+                                            if ui
+                                                .add_enabled(
+                                                    propre,
+                                                    egui::Button::new("↺ Défaut").small(),
+                                                )
+                                                .on_hover_text("Supprime le réglage propre : la paire suit le défaut")
+                                                .clicked()
+                                            {
+                                                actions.push(ActionReglages::RevenirAuDefaut(
+                                                    portee.clone(),
+                                                ));
+                                            }
+                                        });
                                         ui.vertical(|ui| {
                                             ui.add(
                                                 egui::Slider::new(
@@ -1203,6 +1433,9 @@ impl eframe::App for ApplicationCryptobot {
             });
             for (symbole, strat) in modifications {
                 self.parametrages.ecrire(&Portee::Paire(symbole), strat);
+            }
+            for action in actions {
+                self.executer_action_reglages(action);
             }
             if appliquer {
                 self.reinitialiser();

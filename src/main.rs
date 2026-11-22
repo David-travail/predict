@@ -111,16 +111,26 @@ fn chercher_config() -> Option<PathBuf> {
 fn charger_configuration(
     demandee: Option<&PathBuf>,
 ) -> Result<ConfigurationApplication, Box<dyn std::error::Error>> {
-    match demandee.cloned().or_else(chercher_config) {
+    let (mut config, dossier) = match demandee.cloned().or_else(chercher_config) {
         Some(chemin) => {
             info!("Configuration : {}", chemin.display());
-            ConfigurationApplication::charger_config(&chemin)
+            let dossier = chemin
+                .parent()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("."));
+            (ConfigurationApplication::charger_config(&chemin)?, dossier)
         }
         None => {
             info!("config.toml introuvable : configuration intégrée utilisée");
-            ConfigurationApplication::depuis_toml(include_str!("../config.toml"))
+            (
+                ConfigurationApplication::depuis_toml(include_str!("../config.toml"))?,
+                std::env::current_dir()?,
+            )
         }
-    }
+    };
+    // Jeton Telegram hors dépôt : variables d'environnement ou .telegram.toml.
+    config.appliquer_secrets_telegram(&dossier)?;
+    Ok(config)
 }
 
 /// Détermine le chemin du fichier de sauvegarde des paramétrages.
@@ -138,12 +148,12 @@ fn chemin_parametrages(demandee: Option<&PathBuf>) -> PathBuf {
 /// Charge les paramétrages sauvegardés ou utilise ceux de la configuration principale.
 ///
 /// Entrées : configuration validée et chemin de sauvegarde.
-/// Sortie : paramétrages avec un réglage explicite complété pour chaque symbole configuré.
+/// Sortie : paramétrages sauvegardés s'ils sont lisibles, sinon ceux de `config.toml`.
 fn charger_parametrages(
     config: &ConfigurationApplication,
     chemin: &std::path::Path,
 ) -> Parametrages {
-    let mut parametrages = if chemin.is_file() {
+    if chemin.is_file() {
         match Parametrages::charger(chemin) {
             Ok(p) => {
                 info!("Paramétrages chargés : {}", chemin.display());
@@ -156,9 +166,7 @@ fn charger_parametrages(
         }
     } else {
         config.parametrages()
-    };
-    parametrages.completer(&config.paires.symboles);
-    parametrages
+    }
 }
 
 fn configuration_telegram(config: &ConfigurationApplication) -> Option<ConfigurationCanalTelegram> {
@@ -331,6 +339,7 @@ fn executer(_avec_arguments: bool) -> Result<(), Box<dyn std::error::Error>> {
             tx_statut,
             rx_commandes,
             notificateur_telegram.clone(),
+            Some(chemin_parametrages),
         ));
         let options = eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default().with_inner_size([900.0, 600.0]),
@@ -378,6 +387,7 @@ fn executer(_avec_arguments: bool) -> Result<(), Box<dyn std::error::Error>> {
             tx_statut,
             rx_commandes,
             notificateur_telegram.clone(),
+            None,
         ));
         let resultat = runtime.block_on(boucle_console(mode, rx_ui, rx_statut));
         drop(tx_commandes);
@@ -414,6 +424,7 @@ fn executer(_avec_arguments: bool) -> Result<(), Box<dyn std::error::Error>> {
             mode: ModeExecution::TempsReel,
             statut: None,
             signaux: Vec::new(),
+            ressources: None,
         };
         let resultat = runtime.block_on(async {
             let listener = tokio::net::TcpListener::from_std(listener)?;
@@ -423,13 +434,13 @@ fn executer(_avec_arguments: bool) -> Result<(), Box<dyn std::error::Error>> {
                 tx_statut,
                 rx_commandes,
                 notificateur_telegram.clone(),
+                Some(chemin_parametrages),
             ));
             ipc::servir(
                 listener,
                 jeton,
                 etat_initial,
                 tx_commandes,
-                chemin_parametrages,
                 rx_ui,
                 rx_statut,
                 notificateur_telegram.clone(),
@@ -473,6 +484,7 @@ fn executer(_avec_arguments: bool) -> Result<(), Box<dyn std::error::Error>> {
                     symboles_ui,
                 )
                 .avec_moteur(connexion.tx_commandes, connexion.rx_statut)
+                .avec_ressources(connexion.rx_ressources)
                 .avec_etat_initial(generation, mode, signaux, statut),
             ))
         }),
@@ -582,6 +594,7 @@ async fn boucle_console(
                             return Ok(());
                         }
                     }
+                    NotificationMoteur::Info(texte) => println!("{texte}"),
                     NotificationMoteur::Erreur(texte) => eprintln!("Erreur de source : {texte}"),
                     NotificationMoteur::Echec(texte) => {
                         eprintln!("Erreur : {texte}");
@@ -608,9 +621,10 @@ struct Contexte {
 
 type Historiques = HashMap<String, Vec<Bougie>>;
 
-/// Exécute une session à la fois et remplace la précédente à chaque commande de l'IHM.
+/// Exécute une session à la fois et remplace la précédente à chaque démarrage ou arrêt demandé.
 ///
-/// Entrées : configuration, canaux de sortie et récepteur des commandes.
+/// Entrées : configuration, canaux de sortie, récepteur des commandes, notificateur et chemin
+/// de sauvegarde des paramétrages (`None` : sauvegarde indisponible).
 /// Sortie : tourne jusqu'à fermeture du canal de commandes; les erreurs de session sont notifiées.
 async fn moteur(
     config: Arc<ConfigurationApplication>,
@@ -618,12 +632,25 @@ async fn moteur(
     tx_statut: mpsc::UnboundedSender<(u64, NotificationMoteur)>,
     mut rx_commandes: mpsc::UnboundedReceiver<CommandeMoteur>,
     notificateur: Option<NotificateurTelegram>,
+    chemin_parametrages: Option<PathBuf>,
 ) {
     let mut session: Option<JoinHandle<()>> = None;
+    let mut generation_courante = 0;
 
     while let Some(commande) = rx_commandes.recv().await {
+        // La sauvegarde n'interrompt pas la session en cours.
+        if let CommandeMoteur::SauvegarderParametrages { parametrages } = &commande {
+            let notification =
+                sauvegarder_parametrages(parametrages, chemin_parametrages.as_deref());
+            let _ = tx_statut.send((generation_courante, notification));
+            continue;
+        }
+
         if let Some(ancienne) = session.take() {
             ancienne.abort();
+        }
+        if let CommandeMoteur::Arreter { generation, .. } = &commande {
+            generation_courante = *generation;
         }
 
         let CommandeMoteur::Demarrer {
@@ -639,6 +666,7 @@ async fn moteur(
         else {
             continue;
         };
+        generation_courante = generation;
 
         if let Some(notificateur) = &notificateur
             && let Err(erreur) = notificateur
@@ -679,6 +707,35 @@ async fn moteur(
                 ctx.echec(erreur);
             }
         }));
+    }
+}
+
+/// Écrit les paramétrages sur disque et prépare le message de résultat pour l'IHM.
+///
+/// Entrées : paramétrages à écrire et chemin de sauvegarde éventuel.
+/// Sortie : statut de réussite, ou erreur si le chemin manque ou si l'écriture échoue.
+fn sauvegarder_parametrages(
+    parametrages: &Parametrages,
+    chemin: Option<&std::path::Path>,
+) -> NotificationMoteur {
+    let Some(chemin) = chemin else {
+        return NotificationMoteur::Erreur(
+            "Sauvegarde des paramétrages indisponible dans ce mode".to_string(),
+        );
+    };
+    match parametrages.sauvegarder(chemin) {
+        Ok(()) => {
+            info!("Paramétrages sauvegardés : {}", chemin.display());
+            NotificationMoteur::Info(format!(
+                "💾 Paramétrages sauvegardés : {}",
+                chemin.display()
+            ))
+        }
+        Err(erreur) => {
+            let message = format!("Sauvegarde des paramétrages impossible : {erreur}");
+            error!("{message}");
+            NotificationMoteur::Erreur(message)
+        }
     }
 }
 

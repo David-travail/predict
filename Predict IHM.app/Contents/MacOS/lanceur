@@ -1,0 +1,5 @@
+#!/bin/bash
+# Lance ihm.sh situé dans le dossier qui contient Predict IHM.app.
+DOSSIER="$(cd "$(dirname "$0")/../../.." && pwd)"
+# exec "$DOSSIER/ihm.sh"
+exec "/Users/dalud/DEV/predict/ihm.sh"

@@ -206,6 +206,51 @@ impl ConfigurationApplication {
         Ok(configuration)
     }
 
+    /// Complète les identifiants Telegram depuis des sources hors dépôt, puis revalide.
+    ///
+    /// Priorité : variables `PREDICT_TELEGRAM_TOKEN` / `PREDICT_TELEGRAM_CHAT_ID`, puis le
+    /// fichier `.telegram.toml` (section `[telegram]`, ignoré par git) du dossier indiqué,
+    /// puis la section `[telegram]` de `config.toml`.
+    ///
+    /// Entrée : dossier où chercher `.telegram.toml`.
+    /// Sortie : `Ok(())`, ou erreur de lecture/parsing du fichier ou de validation.
+    pub fn appliquer_secrets_telegram(&mut self, dossier: &Path) -> Result<(), Box<dyn Error>> {
+        #[derive(Deserialize)]
+        struct FichierSecrets {
+            #[serde(default)]
+            telegram: ConfigurationTelegram,
+        }
+
+        let chemin = dossier.join(".telegram.toml");
+        if chemin.is_file() {
+            let contenu = fs::read_to_string(&chemin).map_err(|erreur| {
+                format!("Impossible de lire '{}': {erreur}", chemin.display())
+            })?;
+            let secrets: FichierSecrets = toml::from_str(&contenu).map_err(|erreur| {
+                format!("Erreur de parsing TOML dans '{}': {erreur}", chemin.display())
+            })?;
+            if !secrets.telegram.jeton_bot.trim().is_empty() {
+                self.telegram.jeton_bot = secrets.telegram.jeton_bot;
+            }
+            if !secrets.telegram.identifiant_chat.trim().is_empty() {
+                self.telegram.identifiant_chat = secrets.telegram.identifiant_chat;
+            }
+        }
+
+        if let Ok(jeton) = std::env::var("PREDICT_TELEGRAM_TOKEN") {
+            if !jeton.trim().is_empty() {
+                self.telegram.jeton_bot = jeton;
+            }
+        }
+        if let Ok(chat) = std::env::var("PREDICT_TELEGRAM_CHAT_ID") {
+            if !chat.trim().is_empty() {
+                self.telegram.identifiant_chat = chat;
+            }
+        }
+
+        self.valider()
+    }
+
     /// Valide la cohérence des valeurs de configuration.
     ///
     /// Entrée : configuration courante.
@@ -244,22 +289,15 @@ impl ConfigurationApplication {
         self.parametrages().valider()
     }
 
-    /// Construit les paramétrages génériques, de groupes et de paires depuis la configuration.
+    /// Construit les paramétrages (défaut + réglages de paires) depuis la configuration.
     ///
     /// Entrée : configuration courante.
-    /// Sortie : paramétrages avec symboles de surcharge normalisés en majuscules.
+    /// Sortie : défaut issu de `[strategy]` ; les paires d'un bloc `[groups]` reçoivent le réglage
+    /// du bloc, les `[overrides]` restant prioritaires.
     pub fn parametrages(&self) -> Parametrages {
         let mut generique = self.strategie.clone();
         generique.unite_temps = self.unites_temps.unite_execution.clone();
-        Parametrages {
-            generique,
-            groupes: self.groupes.clone(),
-            paires: self
-                .surcharges
-                .iter()
-                .map(|(k, v)| (k.to_uppercase(), v.clone()))
-                .collect(),
-        }
+        Parametrages::depuis_niveaux(generique, &self.groupes, &self.surcharges)
     }
 }
 
@@ -312,7 +350,10 @@ impl ConfigurationStrategie {
     }
 }
 
-/// Bloc de paires partageant un même paramétrage (section `[groups.<nom>]`).
+/// Bloc de paires partageant un même paramétrage (section `[groups.<nom>]` de `config.toml`).
+///
+/// Conservé pour compatibilité : au chargement, le réglage du bloc est recopié dans chacune
+/// de ses paires (voir [`ConfigurationApplication::parametrages`]).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ConfigurationGroupe {
     #[serde(rename = "symbols")]
@@ -322,58 +363,152 @@ pub struct ConfigurationGroupe {
     pub strategie: Option<ConfigurationStrategie>,
 }
 
-/// Portée d'un paramétrage, de la plus large à la plus précise.
+/// Portée d'un réglage : le réglage par défaut ou celui d'une paire.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Portee {
     Generique,
-    Groupe(String),
     Paire(String),
 }
 
-/// Ensemble des paramétrages : priorité paire > bloc > générique.
+/// Réglages des indicateurs : un réglage par défaut et, éventuellement, un réglage propre
+/// à chaque paire. Une paire sans réglage propre utilise le réglage par défaut.
+///
+/// Sur disque (`parametres.toml`) et sur le réseau, chaque réglage est une table plate :
+/// copier les réglages d'une paire revient à dupliquer sa section et à changer son nom.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "FichierParametrages", into = "FichierParametrages")]
 pub struct Parametrages {
-    #[serde(rename = "strategy")]
     pub generique: ConfigurationStrategie,
-    #[serde(rename = "groups", default)]
-    pub groupes: BTreeMap<String, ConfigurationGroupe>,
-    #[serde(rename = "overrides", default)]
     pub paires: BTreeMap<String, ConfigurationStrategie>,
 }
 
-impl Parametrages {
-    /// Crée un réglage propre pour chaque symbole qui n'en possède pas déjà un.
-    ///
-    /// Entrée : symboles à compléter.
-    /// Sortie : met à jour les surcharges en copiant le réglage effectif hérité.
-    pub fn completer(&mut self, symboles: &[String]) {
-        for symbole in symboles {
-            let cle = symbole.to_uppercase();
-            if !self.paires.contains_key(&cle) {
-                let s = self.resoudre(&cle).clone();
-                self.paires.insert(cle, s);
-            }
+/// Format de `parametres.toml` : `[defaut]` puis une section `[paires.<SYMBOLE>]` par paire.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FichierParametrages {
+    defaut: ReglageIndicateurs,
+    #[serde(default)]
+    paires: BTreeMap<String, ReglageIndicateurs>,
+}
+
+/// Réglage d'indicateurs sous forme plate (une seule table TOML, sans sous-table).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReglageIndicateurs {
+    timeframe: String,
+    min_score_alert: u32,
+    ema_period: u32,
+    use_supertrend: bool,
+    #[serde(default = "periode_supertrend_defaut")]
+    supertrend_period: u32,
+    #[serde(default = "multiplicateur_supertrend_defaut")]
+    supertrend_multiplier: f64,
+    adx_period: u32,
+    adx_min_threshold: f64,
+    volume_sma_period: u32,
+    volume_multiplier: f64,
+}
+
+impl From<ConfigurationStrategie> for ReglageIndicateurs {
+    fn from(s: ConfigurationStrategie) -> Self {
+        Self {
+            timeframe: s.unite_temps,
+            min_score_alert: s.score_min_alerte,
+            ema_period: s.filtre_macro.periode_ema,
+            use_supertrend: s.filtre_macro.utiliser_supertrend,
+            supertrend_period: s.filtre_macro.periode_supertrend,
+            supertrend_multiplier: s.filtre_macro.multiplicateur_supertrend,
+            adx_period: s.adx.periode,
+            adx_min_threshold: s.adx.seuil_minimal,
+            volume_sma_period: s.volume.periode_moyenne_mobile,
+            volume_multiplier: s.volume.multiplicateur,
         }
     }
+}
 
-    /// Copie le réglage d'une portée vers les paires qu'elle couvre (toutes pour le générique).
-    ///
-    /// Entrées : portée source et liste des symboles; la portée groupe utilise ses propres membres.
-    /// Sortie : met à jour les réglages explicites des paires concernées.
-    pub fn propager(&mut self, portee: &Portee, symboles: &[String]) {
-        let source = self.lire(portee);
-        let cibles: Vec<String> = match portee {
-            Portee::Generique => symboles.to_vec(),
-            Portee::Groupe(nom) => self
-                .groupes
-                .get(nom)
-                .map(|g| g.symboles.clone())
-                .unwrap_or_default(),
-            Portee::Paire(_) => Vec::new(),
-        };
-        for symbole in cibles {
-            self.paires.insert(symbole.to_uppercase(), source.clone());
+impl From<ReglageIndicateurs> for ConfigurationStrategie {
+    fn from(r: ReglageIndicateurs) -> Self {
+        Self {
+            score_min_alerte: r.min_score_alert,
+            filtre_macro: ConfigurationMacro {
+                periode_ema: r.ema_period,
+                utiliser_supertrend: r.use_supertrend,
+                periode_supertrend: r.supertrend_period,
+                multiplicateur_supertrend: r.supertrend_multiplier,
+            },
+            adx: ConfigurationAdx {
+                periode: r.adx_period,
+                seuil_minimal: r.adx_min_threshold,
+            },
+            volume: ConfigurationVolume {
+                periode_moyenne_mobile: r.volume_sma_period,
+                multiplicateur: r.volume_multiplier,
+            },
+            unite_temps: r.timeframe,
         }
+    }
+}
+
+impl From<Parametrages> for FichierParametrages {
+    fn from(p: Parametrages) -> Self {
+        Self {
+            defaut: p.generique.into(),
+            paires: p.paires.into_iter().map(|(k, v)| (k, v.into())).collect(),
+        }
+    }
+}
+
+impl TryFrom<FichierParametrages> for Parametrages {
+    type Error = String;
+
+    fn try_from(f: FichierParametrages) -> Result<Self, String> {
+        let parametrages = Self {
+            generique: f.defaut.into(),
+            paires: f
+                .paires
+                .into_iter()
+                .map(|(k, v)| (k.to_uppercase(), v.into()))
+                .collect(),
+        };
+        parametrages.valider().map_err(|e| e.to_string())?;
+        Ok(parametrages)
+    }
+}
+
+/// Ancien format de `parametres.toml` (`[strategy]`, `[groups]`, `[overrides]`), relu pour migration.
+#[derive(Deserialize)]
+struct AncienFichierParametrages {
+    strategy: ConfigurationStrategie,
+    #[serde(default)]
+    groups: BTreeMap<String, ConfigurationGroupe>,
+    #[serde(default)]
+    overrides: BTreeMap<String, ConfigurationStrategie>,
+}
+
+impl Parametrages {
+    /// Construit des paramétrages à partir d'un réglage par défaut, de blocs et de réglages de paires.
+    ///
+    /// Entrées : réglage par défaut, blocs de paires et réglages propres (prioritaires sur les blocs).
+    /// Sortie : paramétrages où chaque paire d'un bloc reçoit le réglage du bloc.
+    fn depuis_niveaux(
+        generique: ConfigurationStrategie,
+        groupes: &BTreeMap<String, ConfigurationGroupe>,
+        surcharges: &BTreeMap<String, ConfigurationStrategie>,
+    ) -> Self {
+        let mut paires = BTreeMap::new();
+        for groupe in groupes.values() {
+            if let Some(s) = &groupe.strategie {
+                for symbole in &groupe.symboles {
+                    paires
+                        .entry(symbole.to_uppercase())
+                        .or_insert_with(|| s.clone());
+                }
+            }
+        }
+        for (symbole, s) in surcharges {
+            paires.insert(symbole.to_uppercase(), s.clone());
+        }
+        Self { generique, paires }
     }
 
     /// Regroupe les symboles par période effective, pour ouvrir un flux par période.
@@ -391,130 +526,143 @@ impl Parametrages {
         groupes
     }
 
-    /// Résout le paramétrage effectif d'une paire selon la priorité paire > groupe > générique.
+    /// Résout le réglage effectif d'une paire : son réglage propre, sinon le réglage par défaut.
     ///
     /// Entrée : symbole de la paire.
     /// Sortie : référence à la stratégie applicable.
     pub fn resoudre(&self, symbole: &str) -> &ConfigurationStrategie {
-        let symbole = symbole.to_uppercase();
-        if let Some(s) = self.paires.get(&symbole) {
-            return s;
-        }
-        self.groupes
-            .values()
-            .filter(|g| g.symboles.iter().any(|x| x.eq_ignore_ascii_case(&symbole)))
-            .find_map(|g| g.strategie.as_ref())
+        self.paires
+            .get(&symbole.to_uppercase())
             .unwrap_or(&self.generique)
     }
 
-    /// Lit le paramétrage d'une portée, hérité du niveau générique si nécessaire.
+    /// Lit le réglage effectif d'une portée.
     ///
     /// Entrée : portée à consulter.
     /// Sortie : copie de la stratégie effective pour cette portée.
     pub fn lire(&self, portee: &Portee) -> ConfigurationStrategie {
         match portee {
             Portee::Generique => self.generique.clone(),
-            Portee::Groupe(nom) => self
-                .groupes
-                .get(nom)
-                .and_then(|g| g.strategie.clone())
-                .unwrap_or_else(|| self.generique.clone()),
             Portee::Paire(symbole) => self.resoudre(symbole).clone(),
         }
     }
 
-    /// Enregistre un réglage pour la portée générique, un groupe ou une paire.
+    /// Enregistre un réglage pour le défaut ou pour une paire.
     ///
-    /// Entrées : portée ciblée et configuration stratégique à appliquer.
-    /// Sortie : met à jour les paramétrages; une portée de groupe inconnue reste inchangée.
+    /// Entrées : portée ciblée et réglage à appliquer.
+    /// Sortie : met à jour les paramétrages ; une paire reçoit ainsi un réglage propre.
     pub fn ecrire(&mut self, portee: &Portee, strategie: ConfigurationStrategie) {
         match portee {
             Portee::Generique => self.generique = strategie,
-            Portee::Groupe(nom) => {
-                if let Some(g) = self.groupes.get_mut(nom) {
-                    g.strategie = Some(strategie);
-                }
-            }
             Portee::Paire(symbole) => {
                 self.paires.insert(symbole.to_uppercase(), strategie);
             }
         }
     }
 
-    /// Supprime le réglage propre d'une portée (le générique ne peut pas être supprimé).
+    /// Copie le réglage effectif d'une portée vers une liste de paires.
     ///
-    /// Entrée : portée à réinitialiser.
-    /// Sortie : retire la surcharge de paire ou de groupe si elle existe.
+    /// Entrées : portée source et symboles cibles (la source elle-même est ignorée).
+    /// Sortie : chaque cible reçoit un réglage propre identique à la source.
+    pub fn copier(&mut self, source: &Portee, cibles: &[String]) {
+        let reglage = self.lire(source);
+        for cible in cibles {
+            let cible = cible.to_uppercase();
+            if *source != Portee::Paire(cible.clone()) {
+                self.paires.insert(cible, reglage.clone());
+            }
+        }
+    }
+
+    /// Supprime le réglage propre d'une paire, qui revient au réglage par défaut.
+    ///
+    /// Entrée : portée à réinitialiser (sans effet sur le défaut).
+    /// Sortie : retire le réglage propre de la paire s'il existe.
     pub fn reinitialiser(&mut self, portee: &Portee) {
-        match portee {
-            Portee::Generique => {}
-            Portee::Groupe(nom) => {
-                if let Some(g) = self.groupes.get_mut(nom) {
-                    g.strategie = None;
-                }
-            }
-            Portee::Paire(symbole) => {
-                self.paires.remove(&symbole.to_uppercase());
-            }
+        if let Portee::Paire(symbole) = portee {
+            self.paires.remove(&symbole.to_uppercase());
         }
     }
 
     /// Indique si une portée possède un réglage explicite.
     ///
     /// Entrée : portée à vérifier.
-    /// Sortie : `true` si le réglage est défini directement (la portée générique l'est toujours).
+    /// Sortie : `true` si le réglage est défini directement (le défaut l'est toujours).
     pub fn a_un_reglage_propre(&self, portee: &Portee) -> bool {
         match portee {
             Portee::Generique => true,
-            Portee::Groupe(nom) => self.groupes.get(nom).is_some_and(|g| g.strategie.is_some()),
             Portee::Paire(symbole) => self.paires.contains_key(&symbole.to_uppercase()),
         }
     }
 
-    /// Valide le réglage générique, tous les groupes et toutes les paires.
+    /// Valide le réglage par défaut et celui de chaque paire.
     ///
     /// Sortie : `Ok(())` si chaque stratégie est cohérente, sinon la première erreur rencontrée.
     pub fn valider(&self) -> Result<(), Box<dyn Error>> {
-        self.generique.valider("strategy")?;
-        for (nom, groupe) in &self.groupes {
-            if let Some(s) = &groupe.strategie {
-                s.valider(&format!("groups.{nom}.strategy"))?;
-            }
-        }
+        self.generique.valider("defaut")?;
         for (symbole, s) in &self.paires {
-            s.valider(&format!("overrides.{symbole}"))?;
+            s.valider(&format!("paires.{symbole}"))?;
         }
         Ok(())
     }
 
-    /// Charge et valide une sauvegarde de paramétrages au format TOML.
+    /// Lit des paramétrages au format TOML (format actuel, ou ancien format migré).
     ///
-    /// Entrée : chemin du fichier.
-    /// Sortie : paramétrages valides avec les symboles normalisés, ou erreur de lecture/parsing/validation.
-    pub fn charger(chemin: &Path) -> Result<Self, Box<dyn Error>> {
-        let contenu = fs::read_to_string(chemin)?;
-        let mut parametrages: Self = toml::from_str(&contenu).map_err(|erreur| {
-            format!(
-                "Erreur de parsing TOML dans '{}': {erreur}",
-                chemin.display()
-            )
-        })?;
-        parametrages.paires = parametrages
-            .paires
-            .into_iter()
-            .map(|(k, v)| (k.to_uppercase(), v))
-            .collect();
-        parametrages.valider()?;
-        Ok(parametrages)
+    /// Entrée : contenu TOML.
+    /// Sortie : paramétrages valides, ou erreur de parsing/validation.
+    pub fn depuis_toml(contenu: &str) -> Result<Self, Box<dyn Error>> {
+        let valeur: toml::Table = toml::from_str(contenu)?;
+        if valeur.contains_key("strategy") {
+            let ancien: AncienFichierParametrages = valeur.try_into()?;
+            let mut p = Self::depuis_niveaux(ancien.strategy, &ancien.groups, &ancien.overrides);
+            // L'ancien format recopiait le générique dans chaque paire : ces copies sont retirées
+            // pour que ces paires suivent de nouveau le réglage par défaut.
+            let generique = p.generique.clone();
+            p.paires.retain(|_, s| *s != generique);
+            p.valider()?;
+            return Ok(p);
+        }
+        Ok(valeur.try_into()?)
     }
 
-    /// Valide puis écrit les paramétrages au format TOML sur disque.
+    /// Convertit les paramétrages en TOML lisible, précédé d'un en-tête explicatif.
+    ///
+    /// Sortie : contenu prêt à être écrit dans `parametres.toml`.
+    pub fn vers_toml(&self) -> Result<String, Box<dyn Error>> {
+        const EN_TETE: &str = "\
+# Réglages des indicateurs, enregistrés par l'IHM (prioritaires sur config.toml).
+# [defaut] s'applique à toute paire qui n'a pas sa propre section [paires.<SYMBOLE>].
+# Pour copier les réglages d'une paire vers une autre : dupliquer sa section et changer
+# le symbole. Pour revenir au défaut : supprimer la section de la paire.
+
+";
+        Ok(format!("{EN_TETE}{}", toml::to_string_pretty(self)?))
+    }
+
+    /// Charge et valide une sauvegarde de paramétrages.
+    ///
+    /// Entrée : chemin du fichier.
+    /// Sortie : paramétrages valides, ou erreur de lecture/parsing/validation.
+    pub fn charger(chemin: &Path) -> Result<Self, Box<dyn Error>> {
+        let contenu = fs::read_to_string(chemin)?;
+        Self::depuis_toml(&contenu).map_err(|erreur| {
+            format!(
+                "Paramétrages invalides dans '{}': {erreur}",
+                chemin.display()
+            )
+            .into()
+        })
+    }
+
+    /// Valide puis écrit les paramétrages sur disque (écriture atomique via un fichier temporaire).
     ///
     /// Entrée : chemin du fichier de sauvegarde.
     /// Sortie : `Ok(())` si l'écriture réussit, sinon une erreur de validation, sérialisation ou I/O.
     pub fn sauvegarder(&self, chemin: &Path) -> Result<(), Box<dyn Error>> {
         self.valider()?;
-        fs::write(chemin, toml::to_string_pretty(self)?)?;
+        let temporaire = chemin.with_extension("toml.tmp");
+        fs::write(&temporaire, self.vers_toml()?)?;
+        fs::rename(&temporaire, chemin)?;
         Ok(())
     }
 }
@@ -649,14 +797,14 @@ mod tests {
     }
 
     #[test]
-    fn priorite_paire_puis_bloc_puis_generique() {
+    fn un_bloc_est_recopie_dans_ses_paires_et_la_surcharge_reste_prioritaire() {
         let mut configuration: ConfigurationApplication = toml::from_str(toml_exemple()).unwrap();
         let mut bloc = configuration.strategie.clone();
         bloc.adx.periode = 20;
         configuration.groupes.insert(
             "majeures".into(),
             ConfigurationGroupe {
-                symboles: vec!["BTCUSDT".into()],
+                symboles: vec!["BTCUSDT".into(), "ETHUSDT".into()],
                 strategie: Some(bloc),
             },
         );
@@ -665,26 +813,46 @@ mod tests {
         configuration.surcharges.insert("btcusdt".into(), paire);
         let p = configuration.parametrages();
         assert_eq!(p.resoudre("BTCUSDT").adx.periode, 30);
-        let mut p2 = p.clone();
-        p2.reinitialiser(&Portee::Paire("BTCUSDT".into()));
-        assert_eq!(p2.resoudre("BTCUSDT").adx.periode, 20);
-        assert_eq!(p2.resoudre("ETHUSDT").adx.periode, 14);
+        assert_eq!(p.resoudre("ethusdt").adx.periode, 20);
+        assert_eq!(p.resoudre("SOLUSDT").adx.periode, 14);
     }
 
     #[test]
-    fn chaque_paire_recoit_son_propre_reglage() {
+    fn une_paire_sans_reglage_propre_suit_le_defaut() {
         let configuration: ConfigurationApplication = toml::from_str(toml_exemple()).unwrap();
         let mut p = configuration.parametrages();
-        p.completer(&configuration.paires.symboles);
-        assert_eq!(p.paires.len(), 2);
+        assert!(p.paires.is_empty());
         p.generique.adx.periode = 99;
-        assert_eq!(p.resoudre("BTCUSDT").adx.periode, 14);
-        p.propager(&Portee::Generique, &configuration.paires.symboles);
-        assert_eq!(p.resoudre("ETHUSDT").adx.periode, 99);
+        assert_eq!(p.resoudre("BTCUSDT").adx.periode, 99);
+
+        let mut propre = p.generique.clone();
+        propre.adx.periode = 7;
+        p.ecrire(&Portee::Paire("btcusdt".into()), propre);
+        assert_eq!(p.resoudre("BTCUSDT").adx.periode, 7);
+        p.reinitialiser(&Portee::Paire("BTCUSDT".into()));
+        assert_eq!(p.resoudre("BTCUSDT").adx.periode, 99);
     }
 
     #[test]
-    fn sauvegarde_et_rechargement() {
+    fn copie_le_reglage_d_une_paire_vers_d_autres() {
+        let configuration: ConfigurationApplication = toml::from_str(toml_exemple()).unwrap();
+        let mut p = configuration.parametrages();
+        let mut source = p.generique.clone();
+        source.volume.multiplicateur = 2.5;
+        p.ecrire(&Portee::Paire("BTCUSDT".into()), source.clone());
+        p.copier(
+            &Portee::Paire("BTCUSDT".into()),
+            &["ethusdt".into(), "BTCUSDT".into(), "SOLUSDT".into()],
+        );
+        assert_eq!(p.resoudre("ETHUSDT"), &source);
+        assert_eq!(p.resoudre("SOLUSDT"), &source);
+        // La copie est indépendante de la source.
+        p.generique.volume.multiplicateur = 9.0;
+        assert_eq!(p.resoudre("ETHUSDT").volume.multiplicateur, 2.5);
+    }
+
+    #[test]
+    fn sauvegarde_dans_un_format_plat_et_rechargement() {
         let configuration: ConfigurationApplication = toml::from_str(toml_exemple()).unwrap();
         let mut p = configuration.parametrages();
         p.ecrire(&Portee::Paire("ETHUSDT".into()), {
@@ -692,11 +860,111 @@ mod tests {
             s.volume.multiplicateur = 2.0;
             s
         });
+        let texte = p.vers_toml().unwrap();
+        assert!(texte.contains("[defaut]"));
+        assert!(texte.contains("[paires.ETHUSDT]"));
+        assert!(
+            !texte.contains(".adx]"),
+            "aucune sous-table attendue :\n{texte}"
+        );
+
         let chemin = std::env::temp_dir().join("predict_parametres_test.toml");
         p.sauvegarder(&chemin).unwrap();
         let relu = Parametrages::charger(&chemin).unwrap();
         let _ = std::fs::remove_file(&chemin);
         assert_eq!(relu, p);
+
+        let json = serde_json::to_string(&p).unwrap();
+        assert_eq!(serde_json::from_str::<Parametrages>(&json).unwrap(), p);
+    }
+
+    #[test]
+    fn une_section_copiee_a_la_main_est_relue() {
+        let texte = r#"
+            [defaut]
+            timeframe = "1h"
+            min_score_alert = 80
+            ema_period = 200
+            use_supertrend = true
+            adx_period = 14
+            adx_min_threshold = 22.0
+            volume_sma_period = 20
+            volume_multiplier = 1.2
+
+            [paires.solEur]
+            timeframe = "4h"
+            min_score_alert = 70
+            ema_period = 100
+            use_supertrend = false
+            adx_period = 10
+            adx_min_threshold = 20.0
+            volume_sma_period = 30
+            volume_multiplier = 1.5
+        "#;
+        let p = Parametrages::depuis_toml(texte).unwrap();
+        assert_eq!(p.resoudre("SOLEUR").unite_temps, "4h");
+        assert_eq!(p.resoudre("SOLEUR").filtre_macro.periode_supertrend, 10);
+        assert_eq!(p.resoudre("BTCEUR").unite_temps, "1h");
+
+        let faute = texte.replace("adx_period = 10", "adx_periode = 10");
+        assert!(Parametrages::depuis_toml(&faute).is_err());
+        let invalide = texte.replace("adx_period = 10", "adx_period = 0");
+        assert!(Parametrages::depuis_toml(&invalide).is_err());
+    }
+
+    #[test]
+    fn valide_le_fichier_parametres_reel() {
+        Parametrages::depuis_toml(include_str!("../parametres.toml")).unwrap();
+    }
+
+    #[test]
+    fn migre_l_ancien_format_de_sauvegarde() {
+        let ancien = r#"
+            [strategy]
+            min_score_alert = 80
+            timeframe = "1h"
+            [strategy.macro_filter]
+            ema_period = 200
+            use_supertrend = true
+            [strategy.adx]
+            period = 14
+            min_threshold = 22.0
+            [strategy.volume]
+            sma_period = 20
+            multiplier = 1.2
+
+            [groups.alts]
+            symbols = ["SOLEUR"]
+            [groups.alts.strategy]
+            min_score_alert = 70
+            timeframe = "4h"
+            [groups.alts.strategy.macro_filter]
+            ema_period = 100
+            use_supertrend = false
+            [groups.alts.strategy.adx]
+            period = 14
+            min_threshold = 20.0
+            [groups.alts.strategy.volume]
+            sma_period = 20
+            multiplier = 1.2
+
+            [overrides.BTCEUR]
+            min_score_alert = 80
+            timeframe = "1h"
+            [overrides.BTCEUR.macro_filter]
+            ema_period = 200
+            use_supertrend = true
+            [overrides.BTCEUR.adx]
+            period = 14
+            min_threshold = 22.0
+            [overrides.BTCEUR.volume]
+            sma_period = 20
+            multiplier = 1.2
+        "#;
+        let p = Parametrages::depuis_toml(ancien).unwrap();
+        // BTCEUR était une simple copie du générique : elle suit de nouveau le défaut.
+        assert_eq!(p.paires.keys().collect::<Vec<_>>(), vec!["SOLEUR"]);
+        assert_eq!(p.resoudre("SOLEUR").unite_temps, "4h");
     }
 
     #[test]

@@ -1,2 +1,10 @@
 /target
 /run.err
+/.predict_token
+/predict-serveur.pid
+/predict-console.log
+/predict-ihm.log
+/.predict_connect
+/.telegram.toml
+/predict*.log
+.DS_Store

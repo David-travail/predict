@@ -24,7 +24,7 @@ multiplier = 1.2
 
 [network]
 rate_limit_ms = 200
-proxy = "http://127.0.0.1:9000"
+# proxy = "http://127.0.0.1:9000"
 
 [data_sources]
 providers = ["binance", "kraken", "coinbase"]
@@ -32,21 +32,14 @@ providers = ["binance", "kraken", "coinbase"]
 [logs]
 retention_days = 7
 
-# Bloc de paires : paramétrage commun (optionnel) ; priorité : paire > bloc > [strategy].
-# [groups.majeures]
-# symbols = ["BTCEUR", "ETHEUR"]
-# [groups.majeures.strategy]
-# min_score_alert = 75
-# [groups.majeures.strategy.macro_filter]
-# ema_period = 100
-# use_supertrend = true
-# [groups.majeures.strategy.adx]
-# period = 14
-# min_threshold = 20.0
-# [groups.majeures.strategy.volume]
-# sma_period = 20
-# multiplier = 1.2
+[telegram]
+# Ne pas mettre le jeton ici (fichier versionné) : utiliser .telegram.toml à côté de
+# config.toml (ignoré par git) ou les variables PREDICT_TELEGRAM_TOKEN / PREDICT_TELEGRAM_CHAT_ID.
+bot_token = ""
+chat_id = ""
 
-# Paramétrage propre à une paire : [overrides.SOLEUR] avec les mêmes sous-tables que [strategy].
-
-# Les réglages modifiés dans l'IHM sont sauvegardés dans parametres.toml (prioritaire sur ce fichier).
+# Réglages par paire : ils se gèrent dans l'IHM (Copier / Coller / Copier vers… / Sauvegarder)
+# et sont enregistrés dans parametres.toml, prioritaire sur ce fichier. [strategy] ci-dessus
+# n'est utilisé qu'en l'absence de parametres.toml.
+# Anciennes sections encore acceptées : [groups.<nom>] (symbols + strategy) et
+# [overrides.<SYMBOLE>] ; elles sont converties en réglages propres de chaque paire.

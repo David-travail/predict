@@ -5,11 +5,10 @@ use crate::ui::{CommandeMoteur, ModeExecution, NotificationMoteur, SignalVisuel}
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{RwLock, Semaphore, broadcast, mpsc};
+use tokio::sync::{RwLock, Semaphore, broadcast, mpsc, watch};
 use tokio::time::{Duration, timeout};
 use tracing::{info, warn};
 
@@ -17,6 +16,66 @@ const CAPACITE_DIFFUSION: usize = 1024;
 const DELAI_AUTHENTIFICATION: Duration = Duration::from_secs(10);
 const TAILLE_MAX_MESSAGE: usize = 1024 * 1024;
 const CLIENTS_MAX: usize = 32;
+const PERIODE_RESSOURCES: Duration = Duration::from_secs(2);
+
+/// Occupation CPU/mémoire du processus serveur, diffusée périodiquement aux IHM.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct RessourcesServeur {
+    /// Part de la capacité CPU totale de la machine utilisée par le serveur (0–100 %).
+    pub cpu_pourcent: f32,
+    /// Mémoire résidente du processus serveur, en octets.
+    pub memoire_octets: u64,
+    /// Mémoire physique totale de la machine, en octets.
+    pub memoire_totale_octets: u64,
+}
+
+/// Mesure l'occupation CPU/mémoire du processus courant.
+struct MesureRessources {
+    systeme: sysinfo::System,
+    pid: sysinfo::Pid,
+    nb_coeurs: f32,
+}
+
+impl MesureRessources {
+    /// Prépare la mesure ; `None` si la plateforme ne permet pas de lire le processus.
+    fn new() -> Option<Self> {
+        let pid = sysinfo::get_current_pid().ok()?;
+        let mut systeme = sysinfo::System::new().ok()?;
+        systeme.refresh_memory();
+        let nb_coeurs = std::thread::available_parallelism()
+            .map(|n| n.get() as f32)
+            .unwrap_or(1.0);
+        let mut mesure = Self {
+            systeme,
+            pid,
+            nb_coeurs,
+        };
+        // Première lecture : sert de référence au calcul du CPU de la mesure suivante.
+        mesure.rafraichir();
+        Some(mesure)
+    }
+
+    fn rafraichir(&mut self) {
+        self.systeme.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::Some(&[self.pid]),
+            false,
+            sysinfo::ProcessRefreshKind::nothing()
+                .with_cpu()
+                .with_memory(),
+        );
+    }
+
+    /// Relit le processus et renvoie l'occupation depuis la mesure précédente.
+    fn mesurer(&mut self) -> Option<RessourcesServeur> {
+        self.rafraichir();
+        let processus = self.systeme.process(self.pid)?;
+        Some(RessourcesServeur {
+            cpu_pourcent: (processus.cpu_usage() / self.nb_coeurs).clamp(0.0, 100.0),
+            memoire_octets: processus.memory(),
+            memoire_totale_octets: self.systeme.total_memory(),
+        })
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EtatServeur {
@@ -27,6 +86,9 @@ pub struct EtatServeur {
     pub mode: ModeExecution,
     pub statut: Option<(u64, NotificationMoteur)>,
     pub signaux: Vec<SignalVisuel>,
+    /// Dernière mesure d'occupation du serveur (absente avec un ancien serveur).
+    #[serde(default)]
+    pub ressources: Option<RessourcesServeur>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -52,6 +114,7 @@ enum EvenementServeur {
         generation: u64,
         notification: NotificationMoteur,
     },
+    Ressources(RessourcesServeur),
 }
 
 pub struct ConnexionUi {
@@ -59,6 +122,7 @@ pub struct ConnexionUi {
     pub rx_signaux: mpsc::Receiver<SignalVisuel>,
     pub rx_statut: mpsc::UnboundedReceiver<(u64, NotificationMoteur)>,
     pub tx_commandes: mpsc::UnboundedSender<CommandeMoteur>,
+    pub rx_ressources: watch::Receiver<Option<RessourcesServeur>>,
 }
 
 /// Connecte l'IHM au moteur, l'authentifie et crée les canaux d'échange.
@@ -92,6 +156,7 @@ pub async fn connecter(
     let (tx_signaux, rx_signaux) = mpsc::channel(256);
     let (tx_statut, rx_statut) = mpsc::unbounded_channel();
     let (tx_commandes, mut rx_commandes) = mpsc::unbounded_channel();
+    let (tx_ressources, rx_ressources) = watch::channel(etat.ressources);
     tokio::spawn(async move {
         let mut ligne = String::new();
         loop {
@@ -131,6 +196,9 @@ pub async fn connecter(
                                     if tx_statut.send((generation, notification)).is_err() {
                                         break;
                                     }
+                                }
+                                MessageServeur::Evenement(EvenementServeur::Ressources(ressources)) => {
+                                    let _ = tx_ressources.send(Some(ressources));
                                 }
                                 MessageServeur::Erreur(message) => {
                                     let _ = tx_statut.send((
@@ -187,20 +255,20 @@ pub async fn connecter(
         rx_signaux,
         rx_statut,
         tx_commandes,
+        rx_ressources,
     })
 }
 
 /// Sert de relais TCP entre les clients IHM et le moteur.
 ///
-/// Entrées : listener, jeton, état initial, canal des commandes moteur, chemin de sauvegarde
-/// et récepteurs des signaux/statuts.
+/// Entrées : listener, jeton, état initial, canal des commandes moteur (qui gère aussi la
+/// sauvegarde des paramétrages) et récepteurs des signaux/statuts.
 /// Sortie : tourne jusqu'à Ctrl+C ou une erreur de listener/canal.
 pub async fn servir(
     listener: TcpListener,
     jeton: String,
     etat_initial: EtatServeur,
     tx_moteur: mpsc::UnboundedSender<CommandeMoteur>,
-    chemin_parametrages: PathBuf,
     mut rx_signaux: mpsc::Receiver<SignalVisuel>,
     mut rx_statut: mpsc::UnboundedReceiver<(u64, NotificationMoteur)>,
     notificateur_telegram: Option<NotificateurTelegram>,
@@ -210,6 +278,12 @@ pub async fn servir(
     let (tx_commandes, mut rx_commandes) = mpsc::unbounded_channel();
     let places_clients = Arc::new(Semaphore::new(CLIENTS_MAX));
     let jeton = Arc::<str>::from(jeton);
+    let mut mesure_ressources = MesureRessources::new();
+    if mesure_ressources.is_none() {
+        warn!("Mesure de l'occupation CPU/mémoire du serveur indisponible");
+    }
+    let mut minuterie_ressources = tokio::time::interval(PERIODE_RESSOURCES);
+    minuterie_ressources.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     info!("Serveur prêt : {}", listener.local_addr()?);
     loop {
@@ -292,7 +366,10 @@ pub async fn servir(
                 };
                 {
                     let mut etat = etat.write().await;
-                    if generation == etat.generation {
+                    // Un message d'information ne remplace pas le statut du mode en cours.
+                    if generation == etat.generation
+                        && !matches!(notification, NotificationMoteur::Info(_))
+                    {
                         etat.statut = Some((generation, notification.clone()));
                     }
                 }
@@ -304,30 +381,6 @@ pub async fn servir(
             }
             commande = rx_commandes.recv() => {
                 let Some(commande) = commande else { continue };
-                if let CommandeMoteur::SauvegarderParametrages { parametrages } = &commande {
-                    let notification = match parametrages.sauvegarder(&chemin_parametrages) {
-                        Ok(()) => NotificationMoteur::Statut(format!(
-                            "Paramétrages sauvegardés : {}",
-                            chemin_parametrages.display()
-                        )),
-                        Err(erreur) => {
-                            let message = format!("Sauvegarde impossible sur le moteur : {erreur}");
-                            tracing::error!("{message}");
-                            NotificationMoteur::Erreur(message)
-                        }
-                    };
-                    let generation = {
-                        let mut etat = etat.write().await;
-                        etat.parametrages = parametrages.clone();
-                        etat.statut = Some((etat.generation, notification.clone()));
-                        etat.generation
-                    };
-                    let _ = tx_evenements.send(EvenementServeur::Statut {
-                        generation,
-                        notification,
-                    });
-                    continue;
-                }
                 {
                     let mut etat = etat.write().await;
                     match &commande {
@@ -340,7 +393,10 @@ pub async fn servir(
                                 NotificationMoteur::Statut("Arrêt demandé".to_string()),
                             ));
                         }
-                        CommandeMoteur::SauvegarderParametrages { .. } => {}
+                        CommandeMoteur::SauvegarderParametrages { parametrages } => {
+                            // Les IHM qui se connectent ensuite reçoivent les réglages sauvegardés.
+                            etat.parametrages = parametrages.clone();
+                        }
                         CommandeMoteur::Demarrer {
                             generation,
                             mode,
@@ -357,13 +413,16 @@ pub async fn servir(
                         }
                     }
                 }
-                if !matches!(
-                    &commande,
-                    CommandeMoteur::SauvegarderParametrages { .. }
-                ) && tx_moteur.send(commande).is_err()
-                {
+                if tx_moteur.send(commande).is_err() {
                     return Err("Le moteur ne reçoit plus de commandes".into());
                 }
+            }
+            _ = minuterie_ressources.tick(), if mesure_ressources.is_some() => {
+                let Some(ressources) = mesure_ressources.as_mut().and_then(MesureRessources::mesurer) else {
+                    continue;
+                };
+                etat.write().await.ressources = Some(ressources);
+                let _ = tx_evenements.send(EvenementServeur::Ressources(ressources));
             }
             _ = tokio::signal::ctrl_c() => {
                 info!("Arrêt du serveur demandé par Ctrl+C");
@@ -531,7 +590,7 @@ where
 /// Sortie : écrit le statut sur stdout et les erreurs sur stderr.
 fn afficher_notification(notification: &NotificationMoteur) {
     match notification {
-        NotificationMoteur::Statut(texte) => println!("{texte}"),
+        NotificationMoteur::Statut(texte) | NotificationMoteur::Info(texte) => println!("{texte}"),
         NotificationMoteur::Erreur(texte) => eprintln!("Erreur de source : {texte}"),
         NotificationMoteur::Echec(texte) => eprintln!("Erreur : {texte}"),
     }
@@ -572,6 +631,7 @@ mod tests {
             mode: ModeExecution::TempsReel,
             statut: None,
             signaux: Vec::new(),
+            ressources: None,
         }
     }
 
@@ -644,5 +704,14 @@ mod tests {
                 .unwrap()
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn mesure_les_ressources_du_processus() {
+        let mut mesure = MesureRessources::new().expect("mesure disponible");
+        let ressources = mesure.mesurer().expect("processus courant lisible");
+        assert!(ressources.memoire_octets > 0);
+        assert!(ressources.memoire_totale_octets >= ressources.memoire_octets);
+        assert!((0.0..=100.0).contains(&ressources.cpu_pourcent));
     }
 }
