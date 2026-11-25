@@ -24,6 +24,8 @@ pub struct ConfigurationApplication {
     pub telegram: ConfigurationTelegram,
     #[serde(rename = "logs", default)]
     pub journaux: ConfigurationJournaux,
+    #[serde(rename = "ui", default)]
+    pub ihm: ConfigurationIhm,
     /// Blocs de paires (`[groups.<nom>]`), chacun avec son paramétrage optionnel.
     #[serde(rename = "groups", default)]
     pub groupes: BTreeMap<String, ConfigurationGroupe>,
@@ -51,6 +53,23 @@ pub struct ConfigurationJournaux {
 impl Default for ConfigurationJournaux {
     fn default() -> Self {
         Self { jours_retention: 7 }
+    }
+}
+
+/// Réglages de l'IHM (section `[ui]`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ConfigurationIhm {
+    /// Intervalle de lecture de l'état du moteur, en millisecondes.
+    #[serde(rename = "refresh_ms")]
+    pub intervalle_actualisation_ms: u64,
+}
+
+impl Default for ConfigurationIhm {
+    fn default() -> Self {
+        Self {
+            intervalle_actualisation_ms: 1000,
+        }
     }
 }
 
@@ -284,6 +303,10 @@ impl ConfigurationApplication {
 
         if self.journaux.jours_retention == 0 {
             return Err("'logs.retention_days' doit être supérieur à 0".into());
+        }
+
+        if !(100..=60_000).contains(&self.ihm.intervalle_actualisation_ms) {
+            return Err("'ui.refresh_ms' doit être compris entre 100 et 60000".into());
         }
 
         self.parametrages().valider()

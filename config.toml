@@ -32,6 +32,11 @@ providers = ["binance", "kraken", "coinbase"]
 [logs]
 retention_days = 7
 
+[ui]
+# Intervalle de lecture de l'état du moteur par l'IHM (100 à 60000 ms). Le moteur s'en sert
+# aussi pour déclarer déconnectée une IHM muette depuis 3 × cet intervalle + 10 s.
+refresh_ms = 1000
+
 [telegram]
 # Ne pas mettre le jeton ici (fichier versionné) : utiliser .telegram.toml à côté de
 # config.toml (ignoré par git) ou les variables PREDICT_TELEGRAM_TOKEN / PREDICT_TELEGRAM_CHAT_ID.

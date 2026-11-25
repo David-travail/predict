@@ -1,33 +1,36 @@
+//! Serveur du moteur : tient l'instantané à jour et répond aux requêtes de l'IHM.
+//!
+//! Une connexion TCP par requête (voir `protocole`). Le serveur ne pousse rien.
+
 use crate::config::Parametrages;
 use crate::data::sources::Fournisseur;
 use crate::data::telegram::NotificateurTelegram;
+use crate::protocole::{
+    ContenuDossier, ContenuEvenement, ENTREES_DOSSIER_MAX, EVENEMENTS_PAR_REPONSE, EtatMoteur,
+    Evenement, ReponseMoteur, RequeteIhm, RessourcesServeur, ecrire_message, lire_ligne_limitee,
+};
 use crate::ui::{CommandeMoteur, ModeExecution, NotificationMoteur, SignalVisuel};
-use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::error::Error;
-use std::net::SocketAddr;
-use std::sync::Arc;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
+use std::future::Future;
+use std::net::{IpAddr, SocketAddr};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+use tokio::io::{BufReader, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{RwLock, Semaphore, broadcast, mpsc, watch};
+use tokio::sync::{Semaphore, mpsc};
 use tokio::time::{Duration, timeout};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
-const CAPACITE_DIFFUSION: usize = 1024;
-const DELAI_AUTHENTIFICATION: Duration = Duration::from_secs(10);
-const TAILLE_MAX_MESSAGE: usize = 1024 * 1024;
+/// Délai maximal pour recevoir la requête d'un client.
+const DELAI_REQUETE: Duration = Duration::from_secs(10);
+/// Connexions traitées simultanément au plus.
 const CLIENTS_MAX: usize = 32;
 const PERIODE_RESSOURCES: Duration = Duration::from_secs(2);
-
-/// Occupation CPU/mémoire du processus serveur, diffusée périodiquement aux IHM.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct RessourcesServeur {
-    /// Part de la capacité CPU totale de la machine utilisée par le serveur (0–100 %).
-    pub cpu_pourcent: f32,
-    /// Mémoire résidente du processus serveur, en octets.
-    pub memoire_octets: u64,
-    /// Mémoire physique totale de la machine, en octets.
-    pub memoire_totale_octets: u64,
-}
+const PERIODE_PRESENCE: Duration = Duration::from_secs(5);
+/// Événements (alertes, erreurs, infos) conservés par le serveur.
+const JOURNAL_MAX: usize = 5000;
 
 /// Mesure l'occupation CPU/mémoire du processus courant.
 struct MesureRessources {
@@ -77,253 +80,298 @@ impl MesureRessources {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EtatServeur {
+/// Réglages de départ du serveur.
+pub struct EtatInitial {
     pub symboles: Vec<String>,
     pub parametrages: Parametrages,
     pub fournisseurs: Vec<Fournisseur>,
-    pub generation: u64,
     pub mode: ModeExecution,
-    pub statut: Option<(u64, NotificationMoteur)>,
-    pub signaux: Vec<SignalVisuel>,
-    /// Dernière mesure d'occupation du serveur (absente avec un ancien serveur).
-    #[serde(default)]
-    pub ressources: Option<RessourcesServeur>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "type", content = "contenu", rename_all = "snake_case")]
-enum RequeteClient {
-    Authentifier { jeton: String },
-    Commande(CommandeMoteur),
+/// Instantané tenu par le serveur, lu par `LireEtat`.
+struct Instantane {
+    instance: u64,
+    generation: u64,
+    mode: ModeExecution,
+    statut: Option<String>,
+    symboles: Vec<String>,
+    parametrages: Parametrages,
+    fournisseurs: Vec<Fournisseur>,
+    paires: BTreeMap<String, SignalVisuel>,
+    nb_messages: u64,
+    dernier_message: Option<Instant>,
+    journal: VecDeque<Evenement>,
+    prochaine_seq: u64,
+    ressources: Option<RessourcesServeur>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", content = "contenu", rename_all = "snake_case")]
-enum MessageServeur {
-    Connecte(EtatServeur),
-    Evenement(EvenementServeur),
-    Erreur(String),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", content = "contenu", rename_all = "snake_case")]
-enum EvenementServeur {
-    Signal(SignalVisuel),
-    Statut {
-        generation: u64,
-        notification: NotificationMoteur,
-    },
-    Ressources(RessourcesServeur),
-}
-
-pub struct ConnexionUi {
-    pub etat: EtatServeur,
-    pub rx_signaux: mpsc::Receiver<SignalVisuel>,
-    pub rx_statut: mpsc::UnboundedReceiver<(u64, NotificationMoteur)>,
-    pub tx_commandes: mpsc::UnboundedSender<CommandeMoteur>,
-    pub rx_ressources: watch::Receiver<Option<RessourcesServeur>>,
-}
-
-/// Connecte l'IHM au moteur, l'authentifie et crée les canaux d'échange.
-///
-/// Entrées : adresse TCP du moteur et jeton d'authentification.
-/// Sortie : état initial et canaux de signaux, statuts et commandes, ou erreur réseau/protocole.
-pub async fn connecter(
-    adresse: &str,
-    jeton: String,
-) -> Result<ConnexionUi, Box<dyn Error + Send + Sync>> {
-    let stream = TcpStream::connect(adresse).await?;
-    let (lecture, ecriture) = stream.into_split();
-    let mut lecteur = BufReader::new(lecture);
-    let mut ecrivain = BufWriter::new(ecriture);
-    ecrire_message(&mut ecrivain, &RequeteClient::Authentifier { jeton }).await?;
-
-    let mut ligne = String::new();
-    timeout(
-        DELAI_AUTHENTIFICATION,
-        lire_ligne_limitee(&mut lecteur, &mut ligne),
-    )
-    .await??;
-    let reponse: MessageServeur = serde_json::from_str(&ligne)?;
-    let MessageServeur::Connecte(etat) = reponse else {
-        return match reponse {
-            MessageServeur::Erreur(message) => Err(message.into()),
-            _ => Err("Réponse inattendue du moteur".into()),
-        };
-    };
-
-    let (tx_signaux, rx_signaux) = mpsc::channel(256);
-    let (tx_statut, rx_statut) = mpsc::unbounded_channel();
-    let (tx_commandes, mut rx_commandes) = mpsc::unbounded_channel();
-    let (tx_ressources, rx_ressources) = watch::channel(etat.ressources);
-    tokio::spawn(async move {
-        let mut ligne = String::new();
-        loop {
-            tokio::select! {
-                resultat = lire_ligne_limitee(&mut lecteur, &mut ligne) => {
-                    match resultat {
-                        Ok(0) => {
-                            let _ = tx_statut.send((
-                                etat.generation,
-                                NotificationMoteur::Echec("Connexion au moteur perdue.".to_string()),
-                            ));
-                            break;
-                        }
-                        Ok(_) => {
-                            let message = match serde_json::from_str::<MessageServeur>(&ligne) {
-                                Ok(message) => message,
-                                Err(erreur) => {
-                                    let _ = tx_statut.send((
-                                        etat.generation,
-                                        NotificationMoteur::Echec(format!(
-                                            "Message reçu du moteur invalide : {erreur}"
-                                        )),
-                                    ));
-                                    break;
-                                }
-                            };
-                            match message {
-                                MessageServeur::Evenement(EvenementServeur::Signal(signal)) => {
-                                    if tx_signaux.send(signal).await.is_err() {
-                                        break;
-                                    }
-                                }
-                                MessageServeur::Evenement(EvenementServeur::Statut {
-                                    generation,
-                                    notification,
-                                }) => {
-                                    if tx_statut.send((generation, notification)).is_err() {
-                                        break;
-                                    }
-                                }
-                                MessageServeur::Evenement(EvenementServeur::Ressources(ressources)) => {
-                                    let _ = tx_ressources.send(Some(ressources));
-                                }
-                                MessageServeur::Erreur(message) => {
-                                    let _ = tx_statut.send((
-                                        etat.generation,
-                                        NotificationMoteur::Echec(message),
-                                    ));
-                                    break;
-                                }
-                                MessageServeur::Connecte(_) => {
-                                    let _ = tx_statut.send((
-                                        etat.generation,
-                                        NotificationMoteur::Echec(
-                                            "Message de connexion inattendu reçu du moteur"
-                                                .to_string(),
-                                        ),
-                                    ));
-                                    break;
-                                }
-                            }
-                            ligne.clear();
-                        }
-                        Err(erreur) => {
-                            let _ = tx_statut.send((
-                                etat.generation,
-                                NotificationMoteur::Echec(format!(
-                                    "Erreur de lecture du moteur : {erreur}"
-                                )),
-                            ));
-                            break;
-                        }
-                    }
-                }
-                commande = rx_commandes.recv() => {
-                    let Some(commande) = commande else { break };
-                    if let Err(erreur) = ecrire_message(
-                        &mut ecrivain,
-                        &RequeteClient::Commande(commande),
-                    ).await {
-                        let _ = tx_statut.send((
-                            etat.generation,
-                            NotificationMoteur::Echec(format!(
-                                "Erreur d'envoi au moteur : {erreur}"
-                            )),
-                        ));
-                        break;
-                    }
-                }
-            }
+impl Instantane {
+    fn new(initial: EtatInitial) -> Self {
+        let instance = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(1, |d| d.as_nanos() as u64)
+            .max(1);
+        Self {
+            instance,
+            generation: 0,
+            mode: initial.mode,
+            statut: None,
+            symboles: initial.symboles,
+            parametrages: initial.parametrages,
+            fournisseurs: initial.fournisseurs,
+            paires: BTreeMap::new(),
+            nb_messages: 0,
+            dernier_message: None,
+            journal: VecDeque::new(),
+            prochaine_seq: 1,
+            ressources: None,
         }
-    });
+    }
 
-    Ok(ConnexionUi {
-        etat,
-        rx_signaux,
-        rx_statut,
-        tx_commandes,
-        rx_ressources,
-    })
+    /// Ajoute un événement au journal plafonné.
+    fn journaliser(&mut self, contenu: ContenuEvenement) {
+        if self.journal.len() >= JOURNAL_MAX {
+            self.journal.pop_front();
+        }
+        self.journal.push_back(Evenement {
+            seq: self.prochaine_seq,
+            contenu,
+        });
+        self.prochaine_seq += 1;
+    }
+
+    /// Ouvre une nouvelle génération : vide l'affichage, le journal et les compteurs.
+    fn nouvelle_generation(&mut self, mode: ModeExecution) -> u64 {
+        self.generation += 1;
+        self.mode = mode;
+        self.statut = None;
+        self.paires.clear();
+        self.journal.clear();
+        self.nb_messages = 0;
+        self.dernier_message = None;
+        self.generation
+    }
+
+    /// Intègre un signal du moteur s'il appartient à la génération courante.
+    ///
+    /// Sortie : `true` si le signal a été retenu.
+    fn recevoir_signal(&mut self, signal: SignalVisuel) -> bool {
+        if signal.generation != self.generation {
+            return false;
+        }
+        // Les signaux d'amorçage (avant l'ouverture du flux) ne comptent pas.
+        if self
+            .statut
+            .as_deref()
+            .is_some_and(|s| s.starts_with('🔴') || s.starts_with('🟡'))
+        {
+            self.nb_messages += 1;
+            self.dernier_message = Some(Instant::now());
+        }
+        if signal.est_alerte {
+            self.journaliser(ContenuEvenement::Alerte(signal.clone()));
+        }
+        self.paires.insert(signal.symbole.clone(), signal);
+        true
+    }
+
+    /// Intègre une notification du moteur si elle appartient à la génération courante.
+    fn recevoir_notification(&mut self, generation: u64, notification: NotificationMoteur) {
+        if generation != self.generation {
+            return;
+        }
+        match notification {
+            NotificationMoteur::Statut(texte) => self.statut = Some(texte),
+            NotificationMoteur::Info(texte) => self.journaliser(ContenuEvenement::Info(texte)),
+            NotificationMoteur::Erreur(texte) => self.journaliser(ContenuEvenement::Erreur(texte)),
+            NotificationMoteur::Echec(texte) => self.journaliser(ContenuEvenement::Echec(texte)),
+        }
+    }
+
+    /// Construit la réponse à `LireEtat` pour un curseur donné.
+    fn etat(&self, curseur: u64) -> EtatMoteur {
+        let mut nouveaux = self.journal.iter().filter(|e| e.seq > curseur);
+        let evenements: Vec<Evenement> =
+            nouveaux.by_ref().take(EVENEMENTS_PAR_REPONSE).cloned().collect();
+        let suite = nouveaux.next().is_some();
+        EtatMoteur {
+            instance: self.instance,
+            generation: self.generation,
+            mode: self.mode,
+            statut: self.statut.clone(),
+            symboles: self.symboles.clone(),
+            parametrages: self.parametrages.clone(),
+            fournisseurs: self.fournisseurs.clone(),
+            paires: self.paires.values().cloned().collect(),
+            nb_messages: self.nb_messages,
+            dernier_message_il_y_a_ms: self
+                .dernier_message
+                .map(|t| t.elapsed().as_millis() as u64),
+            evenements,
+            suite,
+            ressources: self.ressources,
+        }
+    }
 }
 
-/// Sert de relais TCP entre les clients IHM et le moteur.
+/// État partagé entre la boucle du serveur et le traitement de chaque requête.
+struct Partage {
+    instantane: Mutex<Instantane>,
+    tx_moteur: mpsc::UnboundedSender<CommandeMoteur>,
+    /// IHM vues récemment (identifiées par IP) et date de leur dernière lecture.
+    ihm: Mutex<HashMap<IpAddr, Instant>>,
+    /// Absence au-delà de laquelle une IHM muette est déclarée déconnectée.
+    delai_absence: Duration,
+    /// Notifie l'arrivée et le départ des IHM (absent : pas de notification).
+    notificateur: Option<NotificateurTelegram>,
+}
+
+impl Partage {
+    /// Ouvre une génération et transmet la commande correspondante au moteur.
+    ///
+    /// Entrées : mode, réglages de session à retenir (pour `Demarrer`) et fabrique de la
+    /// commande à partir de la génération attribuée.
+    /// Sortie : génération attribuée, ou erreur si le moteur ne reçoit plus de commandes.
+    fn commander(
+        &self,
+        mode: ModeExecution,
+        reglages: Option<(Parametrages, Vec<Fournisseur>)>,
+        commande: impl FnOnce(u64) -> CommandeMoteur,
+    ) -> Result<u64, String> {
+        let mut instantane = self.instantane.lock().expect("instantané verrouillé");
+        let generation = instantane.nouvelle_generation(mode);
+        if let Some((parametrages, fournisseurs)) = reglages {
+            instantane.parametrages = parametrages;
+            instantane.fournisseurs = fournisseurs;
+        }
+        // Envoi sous verrou : deux IHM concurrentes ne peuvent pas inverser l'ordre des générations.
+        self.tx_moteur
+            .send(commande(generation))
+            .map_err(|_| "Le moteur est arrêté.".to_string())?;
+        Ok(generation)
+    }
+
+    /// Note la lecture d'une IHM ; notifie sa première apparition.
+    fn enregistrer_lecture(&self, ip: IpAddr) {
+        let nouvelle = self
+            .ihm
+            .lock()
+            .expect("liste des IHM verrouillée")
+            .insert(ip, Instant::now())
+            .is_none();
+        if nouvelle {
+            info!("IHM connectée : {ip}");
+            self.notifier(format!("🖥 IHM connectée ({ip})"));
+        }
+    }
+
+    /// Retire une IHM qui annonce sa fermeture.
+    fn retirer(&self, ip: IpAddr) {
+        let presente = self
+            .ihm
+            .lock()
+            .expect("liste des IHM verrouillée")
+            .remove(&ip)
+            .is_some();
+        if presente {
+            info!("IHM déconnectée : {ip}");
+            self.notifier(format!("🔌 IHM déconnectée ({ip})"));
+        }
+    }
+
+    /// Déclare déconnectées les IHM muettes depuis plus de `delai_absence`.
+    fn verifier_absences(&self) {
+        let absentes: Vec<IpAddr> = {
+            let mut ihm = self.ihm.lock().expect("liste des IHM verrouillée");
+            let absentes: Vec<IpAddr> = ihm
+                .iter()
+                .filter(|(_, vue)| vue.elapsed() > self.delai_absence)
+                .map(|(ip, _)| *ip)
+                .collect();
+            for ip in &absentes {
+                ihm.remove(ip);
+            }
+            absentes
+        };
+        for ip in absentes {
+            info!("IHM sans nouvelles, considérée déconnectée : {ip}");
+            self.notifier(format!("🔌 IHM déconnectée ({ip}, sans nouvelles)"));
+        }
+    }
+
+    fn notifier(&self, message: String) {
+        if let Some(notificateur) = self.notificateur.clone() {
+            tokio::spawn(async move {
+                if let Err(erreur) = notificateur.notifier(message).await {
+                    error!("Impossible d'envoyer la notification Telegram : {erreur}");
+                }
+            });
+        }
+    }
+}
+
+/// Options du serveur.
+pub struct OptionsServeur {
+    /// Intervalle de lecture des IHM : sert à détecter leur disparition.
+    pub intervalle_ihm: Duration,
+    /// Notifie l'arrivée et le départ des IHM.
+    pub notificateur_presence: Option<NotificateurTelegram>,
+    /// Affiche statuts et alertes de test dans la console.
+    pub console: bool,
+}
+
+/// Fait tourner le serveur : agrège ce que produit le moteur et répond aux IHM.
 ///
-/// Entrées : listener, jeton, état initial, canal des commandes moteur (qui gère aussi la
-/// sauvegarde des paramétrages) et récepteurs des signaux/statuts.
-/// Sortie : tourne jusqu'à Ctrl+C ou une erreur de listener/canal.
+/// Entrées : listener, état de départ, canal des commandes moteur, récepteurs des signaux et
+/// statuts du moteur, options et futur dont la fin arrête le serveur.
+/// Sortie : `Ok(())` à l'arrêt demandé, erreur si le listener ou un canal du moteur échoue.
 pub async fn servir(
     listener: TcpListener,
-    jeton: String,
-    etat_initial: EtatServeur,
+    initial: EtatInitial,
     tx_moteur: mpsc::UnboundedSender<CommandeMoteur>,
     mut rx_signaux: mpsc::Receiver<SignalVisuel>,
     mut rx_statut: mpsc::UnboundedReceiver<(u64, NotificationMoteur)>,
-    notificateur_telegram: Option<NotificateurTelegram>,
+    options: OptionsServeur,
+    arret: impl Future<Output = ()>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let etat = Arc::new(RwLock::new(etat_initial));
-    let (tx_evenements, _) = broadcast::channel(CAPACITE_DIFFUSION);
-    let (tx_commandes, mut rx_commandes) = mpsc::unbounded_channel();
-    let places_clients = Arc::new(Semaphore::new(CLIENTS_MAX));
-    let jeton = Arc::<str>::from(jeton);
+    let partage = Arc::new(Partage {
+        instantane: Mutex::new(Instantane::new(initial)),
+        tx_moteur,
+        ihm: Mutex::new(HashMap::new()),
+        delai_absence: options.intervalle_ihm * 3 + Duration::from_secs(10),
+        notificateur: options.notificateur_presence,
+    });
+    let places = Arc::new(Semaphore::new(CLIENTS_MAX));
     let mut mesure_ressources = MesureRessources::new();
     if mesure_ressources.is_none() {
         warn!("Mesure de l'occupation CPU/mémoire du serveur indisponible");
     }
     let mut minuterie_ressources = tokio::time::interval(PERIODE_RESSOURCES);
     minuterie_ressources.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut minuterie_presence = tokio::time::interval(PERIODE_PRESENCE);
+    minuterie_presence.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    tokio::pin!(arret);
 
     info!("Serveur prêt : {}", listener.local_addr()?);
     loop {
         tokio::select! {
             connexion = listener.accept() => {
-                let (stream, adresse) = connexion?;
-                let Ok(permit) = Arc::clone(&places_clients).try_acquire_owned() else {
-                    warn!("Connexion refusée : limite de clients atteinte ({CLIENTS_MAX})");
-                    drop(stream);
+                let (stream, adresse) = match connexion {
+                    Ok(connexion) => connexion,
+                    Err(erreur) => {
+                        warn!("Connexion entrante refusée : {erreur}");
+                        continue;
+                    }
+                };
+                let Ok(place) = Arc::clone(&places).try_acquire_owned() else {
+                    warn!("Connexion refusée : {CLIENTS_MAX} requêtes déjà en cours");
                     continue;
                 };
-                info!("Connexion entrante : {adresse}");
-                let jeton_client = Arc::clone(&jeton);
-                let evenements_client = tx_evenements.clone();
-                let etat_client = Arc::clone(&etat);
-                let commandes_client = tx_commandes.clone();
-                let notificateur_client = notificateur_telegram.clone();
+                let partage = Arc::clone(&partage);
                 tokio::spawn(async move {
-                    let _permit = permit;
-                    let connectee = gerer_client(
-                        stream,
-                        adresse,
-                        jeton_client,
-                        evenements_client,
-                        etat_client,
-                        commandes_client,
-                        notificateur_client.clone(),
-                    )
-                    .await;
-                    if connectee {
-                        info!("IHM déconnectée : {adresse}");
-                        if let Some(notificateur) = notificateur_client
-                            && let Err(erreur) = notificateur
-                                .notifier(format!("🔌 IHM déconnectée ({adresse})"))
-                                .await
-                        {
-                            tracing::error!(
-                                "Impossible d'envoyer la notification de déconnexion Telegram : {erreur}"
-                            );
-                        }
+                    let _place = place;
+                    if let Err(erreur) = gerer_client(stream, adresse, &partage).await {
+                        warn!("Requête de {adresse} : {erreur}");
                     }
                 });
             }
@@ -331,21 +379,14 @@ pub async fn servir(
                 let Some(signal) = signal else {
                     return Err("Le canal de signaux du moteur est fermé".into());
                 };
-                let mode_courant = {
-                    let mut etat = etat.write().await;
-                    if signal.generation == etat.generation {
-                        etat.signaux.retain(|ancien| ancien.symbole != signal.symbole);
-                        etat.signaux.push(signal.clone());
-                        Some(etat.mode)
-                    } else {
-                        None
-                    }
+                let (retenu, mode) = {
+                    let mut instantane = partage.instantane.lock().expect("instantané verrouillé");
+                    (instantane.recevoir_signal(signal.clone()), instantane.mode)
                 };
-                if signal.est_alerte
-                    && matches!(
-                        mode_courant,
-                        Some(ModeExecution::BacktestPeriode | ModeExecution::BacktestFichier)
-                    )
+                if options.console
+                    && retenu
+                    && signal.est_alerte
+                    && matches!(mode, ModeExecution::BacktestPeriode | ModeExecution::BacktestFichier)
                 {
                     println!(
                         "[{}] ALERTE {} {} | Prix: {:.2} | ADX: {:.1} | Vol Ratio: {:.2}x | SCORE: {}/100",
@@ -358,236 +399,241 @@ pub async fn servir(
                         signal.score
                     );
                 }
-                let _ = tx_evenements.send(EvenementServeur::Signal(signal));
             }
             notification = rx_statut.recv() => {
                 let Some((generation, notification)) = notification else {
                     return Err("Le canal de statuts du moteur est fermé".into());
                 };
-                {
-                    let mut etat = etat.write().await;
-                    // Un message d'information ne remplace pas le statut du mode en cours.
-                    if generation == etat.generation
-                        && !matches!(notification, NotificationMoteur::Info(_))
-                    {
-                        etat.statut = Some((generation, notification.clone()));
-                    }
+                if options.console {
+                    afficher_notification(&notification);
                 }
-                afficher_notification(&notification);
-                let _ = tx_evenements.send(EvenementServeur::Statut {
-                    generation,
-                    notification,
-                });
-            }
-            commande = rx_commandes.recv() => {
-                let Some(commande) = commande else { continue };
-                {
-                    let mut etat = etat.write().await;
-                    match &commande {
-                        CommandeMoteur::Arreter { generation, mode } => {
-                            etat.generation = *generation;
-                            etat.mode = *mode;
-                            etat.signaux.clear();
-                            etat.statut = Some((
-                                *generation,
-                                NotificationMoteur::Statut("Arrêt demandé".to_string()),
-                            ));
-                        }
-                        CommandeMoteur::SauvegarderParametrages { parametrages } => {
-                            // Les IHM qui se connectent ensuite reçoivent les réglages sauvegardés.
-                            etat.parametrages = parametrages.clone();
-                        }
-                        CommandeMoteur::Demarrer {
-                            generation,
-                            mode,
-                            parametrages,
-                            fournisseurs,
-                            ..
-                        } => {
-                            etat.generation = *generation;
-                            etat.mode = *mode;
-                            etat.parametrages = parametrages.clone();
-                            etat.fournisseurs = fournisseurs.clone();
-                            etat.signaux.clear();
-                            etat.statut = None;
-                        }
-                    }
-                }
-                if tx_moteur.send(commande).is_err() {
-                    return Err("Le moteur ne reçoit plus de commandes".into());
-                }
+                partage
+                    .instantane
+                    .lock()
+                    .expect("instantané verrouillé")
+                    .recevoir_notification(generation, notification);
             }
             _ = minuterie_ressources.tick(), if mesure_ressources.is_some() => {
-                let Some(ressources) = mesure_ressources.as_mut().and_then(MesureRessources::mesurer) else {
-                    continue;
-                };
-                etat.write().await.ressources = Some(ressources);
-                let _ = tx_evenements.send(EvenementServeur::Ressources(ressources));
+                if let Some(ressources) = mesure_ressources.as_mut().and_then(MesureRessources::mesurer) {
+                    partage.instantane.lock().expect("instantané verrouillé").ressources = Some(ressources);
+                }
             }
-            _ = tokio::signal::ctrl_c() => {
-                info!("Arrêt du serveur demandé par Ctrl+C");
+            _ = minuterie_presence.tick() => partage.verifier_absences(),
+            _ = &mut arret => {
+                info!("Arrêt du serveur demandé");
                 return Ok(());
             }
         }
     }
 }
 
-/// Authentifie un client, puis relaie ses commandes et les événements du moteur.
+/// Traite une requête : lit une ligne, répond par une ligne, ferme.
 ///
-/// Entrées : connexion TCP, adresse distante, jeton, diffuseur, état, commandes et notificateur.
-/// Sortie : `true` si le client a été authentifié, même s'il s'est ensuite déconnecté.
+/// Entrées : connexion, adresse du client et état partagé.
+/// Sortie : `Ok(())` après réponse, ou erreur de lecture/écriture.
 async fn gerer_client(
     stream: TcpStream,
     adresse: SocketAddr,
-    jeton_attendu: Arc<str>,
-    tx_evenements: broadcast::Sender<EvenementServeur>,
-    etat: Arc<RwLock<EtatServeur>>,
-    tx_commandes: mpsc::UnboundedSender<CommandeMoteur>,
-    notificateur_telegram: Option<NotificateurTelegram>,
-) -> bool {
+    partage: &Partage,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     let (lecture, ecriture) = stream.into_split();
     let mut lecteur = BufReader::new(lecture);
     let mut ecrivain = BufWriter::new(ecriture);
-    let mut abonnement = tx_evenements.subscribe();
     let mut ligne = String::new();
 
-    let authentification = timeout(
-        DELAI_AUTHENTIFICATION,
-        lire_ligne_limitee(&mut lecteur, &mut ligne),
-    )
-    .await;
-    let valide = matches!(authentification, Ok(Ok(_)))
-        && matches!(
-            serde_json::from_str::<RequeteClient>(&ligne),
-            Ok(RequeteClient::Authentifier { ref jeton }) if jeton.as_str() == jeton_attendu.as_ref()
-        );
-    if !valide {
-        let _ = ecrire_message(
-            &mut ecrivain,
-            &MessageServeur::Erreur("Authentification refusée ou délai dépassé".to_string()),
-        )
-        .await;
-        warn!("Authentification refusée");
-        return false;
-    }
+    let lue = match timeout(DELAI_REQUETE, lire_ligne_limitee(&mut lecteur, &mut ligne)).await {
+        Ok(lue) => lue,
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "délai de lecture de la requête dépassé",
+        )),
+    };
+    let reponse = match lue {
+        Ok(0) => return Ok(()),
+        Ok(_) => match serde_json::from_str::<RequeteIhm>(&ligne) {
+            Ok(requete) => traiter(requete, adresse.ip(), partage).await,
+            Err(erreur) => echec(format!("Requête invalide : {erreur}")),
+        },
+        Err(erreur) => echec(format!("Requête illisible : {erreur}")),
+    };
+    ecrire_message(&mut ecrivain, &reponse).await
+}
 
-    let etat_initial = etat.read().await.clone();
-    if let Err(erreur) =
-        ecrire_message(&mut ecrivain, &MessageServeur::Connecte(etat_initial)).await
-    {
-        warn!("Impossible d'envoyer l'état initial au client : {erreur}");
-        return false;
-    }
-    info!("IHM authentifiée : {adresse}");
-    if let Some(notificateur) = &notificateur_telegram
-        && let Err(erreur) = notificateur
-            .notifier(format!("🖥 IHM connectée ({adresse})"))
-            .await
-    {
-        tracing::error!("Impossible d'envoyer la notification de connexion Telegram : {erreur}");
-    }
-    ligne.clear();
-
-    loop {
-        tokio::select! {
-            resultat = lire_ligne_limitee(&mut lecteur, &mut ligne) => {
-                match resultat {
-                    Ok(0) => return true,
-                    Ok(_) => {
-                        match serde_json::from_str::<RequeteClient>(&ligne) {
-                            Ok(RequeteClient::Commande(commande)) => {
-                                if tx_commandes.send(commande).is_err() {
-                                    let _ = ecrire_message(
-                                        &mut ecrivain,
-                                        &MessageServeur::Erreur("Le moteur est arrêté".to_string()),
-                                    ).await;
-                                    return true;
-                                }
-                            }
-                            Ok(RequeteClient::Authentifier { .. }) => {
-                                warn!("Nouvelle authentification ignorée sur une connexion active");
-                                return true;
-                            }
-                            Err(erreur) => {
-                                warn!("Commande reçue invalide : {erreur}");
-                                return true;
-                            }
-                        }
-                        ligne.clear();
-                    }
-                    Err(erreur) => {
-                        warn!("Erreur de lecture client : {erreur}");
-                        return true;
-                    }
-                }
+/// Exécute une requête de l'IHM et construit la réponse.
+async fn traiter(requete: RequeteIhm, ip: IpAddr, partage: &Partage) -> ReponseMoteur {
+    match requete {
+        RequeteIhm::LireEtat { curseur } => {
+            partage.enregistrer_lecture(ip);
+            let etat = partage
+                .instantane
+                .lock()
+                .expect("instantané verrouillé")
+                .etat(curseur);
+            ReponseMoteur::Etat(etat)
+        }
+        RequeteIhm::Demarrer {
+            mode,
+            date_debut,
+            date_fin,
+            chemin_fichier,
+            symboles_test,
+            parametrages,
+            fournisseurs,
+        } => {
+            if let Err(erreur) = parametrages.valider() {
+                return echec(format!("Réglages invalides : {erreur}"));
             }
-            evenement = abonnement.recv() => {
-                let message = match evenement {
-                    Ok(evenement) => MessageServeur::Evenement(evenement),
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                        let _ = ecrire_message(
-                            &mut ecrivain,
-                            &MessageServeur::Erreur("Le client ne suit plus le flux du moteur ; reconnectez l'IHM".to_string()),
-                        ).await;
-                        return true;
-                    }
-                    Err(broadcast::error::RecvError::Closed) => return true,
-                };
-                if let Err(erreur) = ecrire_message(&mut ecrivain, &message).await {
-                    warn!("Erreur d'envoi au client : {erreur}");
-                    return true;
+            if fournisseurs.is_empty() {
+                return echec("Sélectionnez au moins un flux de données.".to_string());
+            }
+            let reglages = Some((parametrages.clone(), fournisseurs.clone()));
+            let resultat = partage.commander(mode, reglages, |generation| {
+                CommandeMoteur::Demarrer {
+                    generation,
+                    mode,
+                    date_debut,
+                    date_fin,
+                    chemin_fichier,
+                    symboles_test,
+                    parametrages,
+                    fournisseurs,
                 }
+            });
+            resultat_commande(resultat, "Démarrage demandé.")
+        }
+        RequeteIhm::Arreter { mode } => {
+            let resultat =
+                partage.commander(mode, None, |generation| CommandeMoteur::Arreter { generation, mode });
+            resultat_commande(resultat, "Arrêt demandé.")
+        }
+        RequeteIhm::SauvegarderParametrages { parametrages } => {
+            if let Err(erreur) = parametrages.valider() {
+                return echec(format!("Réglages invalides : {erreur}"));
+            }
+            // Les IHM qui se connectent ensuite reçoivent les réglages sauvegardés.
+            partage
+                .instantane
+                .lock()
+                .expect("instantané verrouillé")
+                .parametrages = parametrages.clone();
+            // Le résultat de l'écriture revient par le journal (Info ou Erreur).
+            let envoi = partage
+                .tx_moteur
+                .send(CommandeMoteur::SauvegarderParametrages { parametrages });
+            match envoi {
+                Ok(()) => ReponseMoteur::Resultat {
+                    succes: true,
+                    message: "Sauvegarde demandée.".to_string(),
+                    generation: None,
+                },
+                Err(_) => echec("Le moteur est arrêté.".to_string()),
+            }
+        }
+        RequeteIhm::ListerDossier { chemin } => {
+            let contenu = tokio::task::spawn_blocking(move || lister_dossier(&chemin))
+                .await
+                .unwrap_or_else(|erreur| ContenuDossier {
+                    erreur: Some(format!("Lecture du dossier interrompue : {erreur}")),
+                    ..ContenuDossier::default()
+                });
+            ReponseMoteur::ContenuDossier(contenu)
+        }
+        RequeteIhm::FermetureIhm => {
+            partage.retirer(ip);
+            ReponseMoteur::Resultat {
+                succes: true,
+                message: "Au revoir.".to_string(),
+                generation: None,
             }
         }
     }
 }
 
-/// Lit une ligne UTF-8 sans dépasser la taille maximale des messages réseau.
+fn echec(message: String) -> ReponseMoteur {
+    ReponseMoteur::Resultat {
+        succes: false,
+        message,
+        generation: None,
+    }
+}
+
+fn resultat_commande(resultat: Result<u64, String>, message: &str) -> ReponseMoteur {
+    match resultat {
+        Ok(generation) => ReponseMoteur::Resultat {
+            succes: true,
+            message: message.to_string(),
+            generation: Some(generation),
+        },
+        Err(erreur) => echec(erreur),
+    }
+}
+
+/// Liste les sous-dossiers et fichiers `.json` d'un dossier de la machine du moteur.
 ///
-/// Entrées : lecteur asynchrone et chaîne à remplir.
-/// Sortie : nombre d'octets lus, `0` à la fin du flux, ou erreur d'I/O/limite/encodage.
-async fn lire_ligne_limitee<R>(lecteur: &mut R, ligne: &mut String) -> std::io::Result<usize>
-where
-    R: AsyncBufRead + Unpin,
-{
-    let mut octets = Vec::new();
-    loop {
-        let (taille, fin_ligne) = {
-            let tampon = lecteur.fill_buf().await?;
-            if tampon.is_empty() {
-                if octets.is_empty() {
-                    ligne.clear();
-                    return Ok(0);
-                }
-                break;
-            }
-            let taille = tampon
-                .iter()
-                .position(|octet| *octet == b'\n')
-                .map_or(tampon.len(), |index| index + 1);
-            if octets.len() + taille > TAILLE_MAX_MESSAGE {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "Message réseau trop volumineux",
-                ));
-            }
-            octets.extend_from_slice(&tampon[..taille]);
-            (taille, tampon[taille - 1] == b'\n')
+/// Entrée : chemin absolu ou relatif au dossier de travail ; vide = dossier de travail.
+/// Sortie : contenu trié et plafonné, ou contenu vide avec `erreur` renseignée.
+fn lister_dossier(chemin: &str) -> ContenuDossier {
+    let demande = if chemin.trim().is_empty() {
+        PathBuf::from(".")
+    } else {
+        PathBuf::from(chemin.trim())
+    };
+    let absolu = match std::fs::canonicalize(&demande) {
+        Ok(absolu) => absolu,
+        Err(erreur) => {
+            return ContenuDossier {
+                chemin: demande.display().to_string(),
+                erreur: Some(format!("Dossier inaccessible : {erreur}")),
+                ..ContenuDossier::default()
+            };
+        }
+    };
+    let mut contenu = ContenuDossier {
+        chemin: absolu.display().to_string(),
+        parent: absolu.parent().map(|p| p.display().to_string()),
+        ..ContenuDossier::default()
+    };
+    let entrees = match std::fs::read_dir(&absolu) {
+        Ok(entrees) => entrees,
+        Err(erreur) => {
+            contenu.erreur = Some(format!("Lecture impossible : {erreur}"));
+            return contenu;
+        }
+    };
+    for entree in entrees.flatten() {
+        let nom = entree.file_name().to_string_lossy().into_owned();
+        if nom.starts_with('.') {
+            continue;
+        }
+        // `metadata` suit les liens symboliques.
+        let Ok(meta) = std::fs::metadata(entree.path()) else {
+            continue;
         };
-        lecteur.consume(taille);
-        if fin_ligne {
-            break;
+        if meta.is_dir() {
+            contenu.dossiers.push(nom);
+        } else if est_json(&entree.path()) {
+            contenu.fichiers_json.push(nom);
         }
     }
-    *ligne = String::from_utf8(octets)
-        .map_err(|erreur| std::io::Error::new(std::io::ErrorKind::InvalidData, erreur))?;
-    Ok(ligne.len())
+    contenu.dossiers.sort_unstable_by_key(|n| n.to_lowercase());
+    contenu.fichiers_json.sort_unstable_by_key(|n| n.to_lowercase());
+    let total = contenu.dossiers.len() + contenu.fichiers_json.len();
+    if total > ENTREES_DOSSIER_MAX {
+        contenu.tronque = true;
+        contenu.dossiers.truncate(ENTREES_DOSSIER_MAX);
+        let reste = ENTREES_DOSSIER_MAX - contenu.dossiers.len();
+        contenu.fichiers_json.truncate(reste);
+    }
+    contenu
 }
 
-/// Affiche une notification du moteur au niveau de journal approprié.
-///
-/// Entrée : notification à afficher.
-/// Sortie : écrit le statut sur stdout et les erreurs sur stderr.
+fn est_json(chemin: &Path) -> bool {
+    chemin
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("json"))
+}
+
+/// Affiche une notification du moteur dans la console.
 fn afficher_notification(notification: &NotificationMoteur) {
     match notification {
         NotificationMoteur::Statut(texte) | NotificationMoteur::Info(texte) => println!("{texte}"),
@@ -596,122 +642,188 @@ fn afficher_notification(notification: &NotificationMoteur) {
     }
 }
 
-/// Sérialise un message JSON et l'écrit sur une ligne du flux réseau.
-///
-/// Entrées : writer asynchrone et message sérialisable.
-/// Sortie : `Ok(())` après écriture et vidage, ou erreur de sérialisation/I/O.
-async fn ecrire_message<W, T>(
-    ecrivain: &mut W,
-    message: &T,
-) -> Result<(), Box<dyn Error + Send + Sync>>
-where
-    W: AsyncWrite + Unpin,
-    T: Serialize,
-{
-    let json = serde_json::to_vec(message)?;
-    ecrivain.write_all(&json).await?;
-    ecrivain.write_all(b"\n").await?;
-    ecrivain.flush().await?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::echanger;
+    use crate::core::modeles::Tendance;
 
-    fn etat_test() -> EtatServeur {
+    fn initial() -> EtatInitial {
         let config =
             crate::config::ConfigurationApplication::depuis_toml(include_str!("../config.toml"))
                 .unwrap();
-        EtatServeur {
+        EtatInitial {
             symboles: config.paires.symboles.clone(),
             parametrages: config.parametrages(),
             fournisseurs: config.sources_donnees.fournisseurs,
-            generation: 0,
             mode: ModeExecution::TempsReel,
-            statut: None,
-            signaux: Vec::new(),
-            ressources: None,
         }
     }
 
-    #[tokio::test]
-    async fn authentifie_le_client_et_echange_commandes_et_evenements() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let adresse = listener.local_addr().unwrap();
-        let (tx_evenements, _) = broadcast::channel(8);
-        let (tx_commandes, mut rx_commandes) = mpsc::unbounded_channel();
-        let etat = Arc::new(RwLock::new(etat_test()));
-        let jeton = Arc::<str>::from("jeton-test-avec-assez-de-caracteres");
-        let jeton_client = jeton.to_string();
-        let tx_evenements_serveur = tx_evenements.clone();
-
-        let serveur = tokio::spawn(async move {
-            let (stream, adresse_client) = listener.accept().await.unwrap();
-            gerer_client(
-                stream,
-                adresse_client,
-                Arc::clone(&jeton),
-                tx_evenements_serveur,
-                etat,
-                tx_commandes,
-                None,
-            )
-            .await
-        });
-
-        let mut connexion = connecter(&adresse.to_string(), jeton_client).await.unwrap();
-        assert_eq!(connexion.etat.generation, 0);
-
-        tx_evenements
-            .send(EvenementServeur::Statut {
-                generation: 0,
-                notification: NotificationMoteur::Statut("Flux actif".to_string()),
-            })
-            .unwrap();
-        let (_, notification) =
-            tokio::time::timeout(Duration::from_secs(1), connexion.rx_statut.recv())
-                .await
-                .unwrap()
-                .unwrap();
-        assert!(matches!(
-            notification,
-            NotificationMoteur::Statut(texte) if texte == "Flux actif"
-        ));
-
-        connexion
-            .tx_commandes
-            .send(CommandeMoteur::Arreter {
-                generation: 1,
-                mode: ModeExecution::BacktestFichier,
-            })
-            .unwrap();
-        let commande = tokio::time::timeout(Duration::from_secs(1), rx_commandes.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(matches!(
-            commande,
-            CommandeMoteur::Arreter {
-                generation: 1,
-                mode: ModeExecution::BacktestFichier
-            }
-        ));
-        drop(connexion);
-        assert!(
-            tokio::time::timeout(Duration::from_secs(1), serveur)
-                .await
-                .unwrap()
-                .unwrap()
-        );
+    fn signal(generation: u64, symbole: &str, alerte: bool) -> SignalVisuel {
+        SignalVisuel {
+            generation,
+            symbole: symbole.to_string(),
+            prix: 1.0,
+            prix_precedent: 1.0,
+            score: 90,
+            adx: 30.0,
+            adx_valide: true,
+            ratio_volume: 1.5,
+            volume_valide: true,
+            tendance: Tendance::Haussiere,
+            est_alerte: alerte,
+            unite: "1h".to_string(),
+            horodatage: "2026-01-01 10:00".to_string(),
+        }
     }
 
     #[test]
-    fn mesure_les_ressources_du_processus() {
-        let mut mesure = MesureRessources::new().expect("mesure disponible");
-        let ressources = mesure.mesurer().expect("processus courant lisible");
-        assert!(ressources.memoire_octets > 0);
-        assert!(ressources.memoire_totale_octets >= ressources.memoire_octets);
-        assert!((0.0..=100.0).contains(&ressources.cpu_pourcent));
+    fn journal_pagine_et_vide_a_chaque_generation() {
+        let mut instantane = Instantane::new(initial());
+        for _ in 0..(EVENEMENTS_PAR_REPONSE + 3) {
+            instantane.recevoir_signal(signal(0, "BTCEUR", true));
+        }
+        // Un signal d'une autre génération est ignoré.
+        assert!(!instantane.recevoir_signal(signal(9, "ETHEUR", true)));
+
+        let premier = instantane.etat(0);
+        assert_eq!(premier.evenements.len(), EVENEMENTS_PAR_REPONSE);
+        assert!(premier.suite);
+        let curseur = premier.evenements.last().unwrap().seq;
+        let second = instantane.etat(curseur);
+        assert_eq!(second.evenements.len(), 3);
+        assert!(!second.suite);
+        assert_eq!(second.paires.len(), 1);
+
+        let seq_avant = instantane.prochaine_seq;
+        assert_eq!(instantane.nouvelle_generation(ModeExecution::Simulation), 1);
+        let apres = instantane.etat(0);
+        assert!(apres.evenements.is_empty());
+        assert!(apres.paires.is_empty());
+        assert_eq!(apres.mode, ModeExecution::Simulation);
+        // Les numéros de séquence continuent de croître.
+        instantane.recevoir_notification(1, NotificationMoteur::Erreur("x".to_string()));
+        assert_eq!(instantane.etat(0).evenements[0].seq, seq_avant);
+    }
+
+    #[test]
+    fn journal_plafonne() {
+        let mut instantane = Instantane::new(initial());
+        for _ in 0..(JOURNAL_MAX + 10) {
+            instantane.journaliser(ContenuEvenement::Info("i".to_string()));
+        }
+        assert_eq!(instantane.journal.len(), JOURNAL_MAX);
+        assert_eq!(instantane.journal.front().unwrap().seq, 11);
+    }
+
+    #[test]
+    fn compte_les_messages_seulement_flux_ouvert() {
+        let mut instantane = Instantane::new(initial());
+        instantane.recevoir_signal(signal(0, "BTCEUR", false));
+        assert_eq!(instantane.nb_messages, 0);
+        instantane.recevoir_notification(0, NotificationMoteur::Statut("🔴 Flux".to_string()));
+        instantane.recevoir_signal(signal(0, "BTCEUR", false));
+        assert_eq!(instantane.nb_messages, 1);
+        assert!(instantane.etat(0).dernier_message_il_y_a_ms.is_some());
+    }
+
+    #[test]
+    fn liste_les_dossiers_et_fichiers_json() {
+        let contenu = lister_dossier(env!("CARGO_MANIFEST_DIR"));
+        assert!(contenu.erreur.is_none());
+        assert!(contenu.dossiers.iter().any(|d| d == "src"));
+        assert!(contenu.fichiers_json.iter().all(|f| f.ends_with(".json")));
+        assert!(contenu.parent.is_some());
+        let absent = lister_dossier("/dossier/qui/n/existe/pas");
+        assert!(absent.erreur.is_some());
+    }
+
+    #[tokio::test]
+    async fn repond_aux_requetes_de_l_ihm() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let adresse = listener.local_addr().unwrap().to_string();
+        let (tx_moteur, mut rx_moteur) = mpsc::unbounded_channel();
+        let (tx_signaux, rx_signaux) = mpsc::channel(8);
+        let (tx_statut, rx_statut) = mpsc::unbounded_channel();
+        let (tx_arret, rx_arret) = tokio::sync::oneshot::channel::<()>();
+        let serveur = tokio::spawn(servir(
+            listener,
+            initial(),
+            tx_moteur,
+            rx_signaux,
+            rx_statut,
+            OptionsServeur {
+                intervalle_ihm: Duration::from_secs(1),
+                notificateur_presence: None,
+                console: false,
+            },
+            async {
+                let _ = rx_arret.await;
+            },
+        ));
+
+        let ReponseMoteur::Etat(etat) = echanger(&adresse, &RequeteIhm::LireEtat { curseur: 0 })
+            .await
+            .unwrap()
+        else {
+            panic!("état attendu");
+        };
+        assert_eq!(etat.generation, 0);
+
+        let reponse = echanger(
+            &adresse,
+            &RequeteIhm::Arreter {
+                mode: ModeExecution::BacktestFichier,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            reponse,
+            ReponseMoteur::Resultat { succes: true, generation: Some(1), .. }
+        ));
+        assert!(matches!(
+            rx_moteur.recv().await.unwrap(),
+            CommandeMoteur::Arreter { generation: 1, mode: ModeExecution::BacktestFichier }
+        ));
+
+        tx_signaux.send(signal(1, "BTCEUR", true)).await.unwrap();
+        tx_statut
+            .send((1, NotificationMoteur::Statut("Analyse".to_string())))
+            .unwrap();
+        // Laisse la boucle du serveur intégrer le signal et le statut.
+        let mut etat = None;
+        for _ in 0..50 {
+            let ReponseMoteur::Etat(lu) = echanger(&adresse, &RequeteIhm::LireEtat { curseur: 0 })
+                .await
+                .unwrap()
+            else {
+                panic!("état attendu");
+            };
+            if lu.statut.is_some() && !lu.evenements.is_empty() {
+                etat = Some(lu);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let etat = etat.expect("signal et statut intégrés");
+        assert_eq!(etat.generation, 1);
+        assert_eq!(etat.mode, ModeExecution::BacktestFichier);
+        assert_eq!(etat.paires.len(), 1);
+        assert!(matches!(etat.evenements[0].contenu, ContenuEvenement::Alerte(_)));
+
+        let invalide = {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut flux = TcpStream::connect(&adresse).await.unwrap();
+            flux.write_all(b"pas du json\n").await.unwrap();
+            let mut texte = String::new();
+            flux.read_to_string(&mut texte).await.unwrap();
+            serde_json::from_str::<ReponseMoteur>(texte.trim()).unwrap()
+        };
+        assert!(matches!(invalide, ReponseMoteur::Resultat { succes: false, .. }));
+
+        let _ = tx_arret.send(());
+        serveur.await.unwrap().unwrap();
     }
 }

@@ -9,9 +9,6 @@
 #   ./serveur.sh statut       Indique si le serveur tourne
 #   ./serveur.sh journal      Suit la sortie console (Ctrl+C quitte le suivi, pas le serveur)
 #
-# Jeton : PREDICT_TOKEN dans l'environnement, sinon le fichier .predict_token à côté
-# du script (une seule ligne, au moins 16 caractères ; faire chmod 600 .predict_token).
-#
 # Variables facultatives :
 #   PREDICT_BIN     chemin de l'exécutable (défaut : ./predict, puis target/release/predict)
 #   PREDICT_LISTEN  adresse d'écoute (défaut : celle du programme, 0.0.0.0:8765)
@@ -23,7 +20,6 @@ cd "$DOSSIER"
 
 FICHIER_PID="$DOSSIER/predict-serveur.pid"
 FICHIER_CONSOLE="$DOSSIER/predict-console.log"
-FICHIER_JETON="$DOSSIER/.predict_token"
 
 trouver_binaire() {
     if [[ -n "${PREDICT_BIN:-}" ]]; then
@@ -59,19 +55,6 @@ demarrer() {
         echo "Le serveur tourne déjà (PID $pid)."
         return 0
     fi
-
-    if [[ -z "${PREDICT_TOKEN:-}" && -f "$FICHIER_JETON" ]]; then
-        PREDICT_TOKEN="$(head -n 1 "$FICHIER_JETON" | tr -d '\r\n')"
-    fi
-    if [[ -z "${PREDICT_TOKEN:-}" ]]; then
-        echo "PREDICT_TOKEN non défini : exportez-le ou écrivez-le dans $FICHIER_JETON." >&2
-        exit 1
-    fi
-    if (( ${#PREDICT_TOKEN} < 16 )); then
-        echo "PREDICT_TOKEN doit contenir au moins 16 caractères." >&2
-        exit 1
-    fi
-    export PREDICT_TOKEN
 
     local binaire
     binaire="$(trouver_binaire)"

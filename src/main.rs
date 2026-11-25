@@ -2,11 +2,13 @@
 // En ligne de commande, on se rattache à la console du terminal parent (voir `rattacher_console`).
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+mod client;
 mod config;
 mod core;
 mod data;
 mod indicators;
 mod ipc;
+mod protocole;
 mod ui;
 
 use crate::config::{ConfigurationApplication, ConfigurationStrategie, Parametrages};
@@ -319,20 +321,19 @@ fn executer(_avec_arguments: bool) -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    let intervalle_ihm = Duration::from_millis(config.ihm.intervalle_actualisation_ms);
+
     if arguments.local {
+        // Moteur et IHM dans le même processus : l'IHM passe par un serveur interne
+        // sur 127.0.0.1, avec le même protocole qu'à distance.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let adresse = listener.local_addr()?.to_string();
         let (tx_ui, rx_ui) = mpsc::channel::<SignalVisuel>(256);
         let (tx_commandes, rx_commandes) = mpsc::unbounded_channel::<CommandeMoteur>();
         let (tx_statut, rx_statut) = mpsc::unbounded_channel::<(u64, NotificationMoteur)>();
-        tx_commandes.send(CommandeMoteur::Demarrer {
-            generation: 0,
-            mode: ModeExecution::TempsReel,
-            date_debut: String::new(),
-            date_fin: String::new(),
-            chemin_fichier: String::new(),
-            symboles_test: config.paires.symboles.clone(),
-            parametrages: parametrages.clone(),
-            fournisseurs: config.sources_donnees.fournisseurs.clone(),
-        })?;
+        tx_commandes.send(demarrage_initial(&config, &parametrages))?;
+        let initial = etat_initial(&config, &parametrages);
         runtime.spawn(moteur(
             Arc::new(config.clone()),
             tx_ui,
@@ -341,25 +342,28 @@ fn executer(_avec_arguments: bool) -> Result<(), Box<dyn std::error::Error>> {
             notificateur_telegram.clone(),
             Some(chemin_parametrages),
         ));
-        let options = eframe::NativeOptions {
-            viewport: egui::ViewportBuilder::default().with_inner_size([900.0, 600.0]),
-            ..Default::default()
-        };
-        let resultat = eframe::run_native(
-            "Crypto Trend Detector H24",
-            options,
-            Box::new(move |_cc| {
-                Ok(Box::new(
-                    ui::ApplicationCryptobot::new(
-                        rx_ui,
-                        parametrages,
-                        config.sources_donnees.fournisseurs.clone(),
-                        config.paires.symboles.clone(),
-                    )
-                    .avec_moteur(tx_commandes, rx_statut),
-                ))
-            }),
-        );
+        let _garde = runtime.enter();
+        let listener = tokio::net::TcpListener::from_std(listener)?;
+        runtime.spawn(async move {
+            let resultat = ipc::servir(
+                listener,
+                initial,
+                tx_commandes,
+                rx_ui,
+                rx_statut,
+                ipc::OptionsServeur {
+                    intervalle_ihm,
+                    notificateur_presence: None,
+                    console: false,
+                },
+                std::future::pending(),
+            )
+            .await;
+            if let Err(erreur) = resultat {
+                error!("Serveur interne arrêté : {erreur}");
+            }
+        });
+        let resultat = lancer_ihm(&config, parametrages, adresse, intervalle_ihm);
         notifier_arret_moteur(&runtime, notificateur_telegram.as_ref());
         runtime.shutdown_background();
         resultat?;
@@ -397,7 +401,6 @@ fn executer(_avec_arguments: bool) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if arguments.serve {
-        let jeton = charger_jeton()?;
         let adresse = arguments
             .listen
             .unwrap_or_else(|| "0.0.0.0:8765".parse().expect("Adresse par défaut valide"));
@@ -406,26 +409,8 @@ fn executer(_avec_arguments: bool) -> Result<(), Box<dyn std::error::Error>> {
         let (tx_ui, rx_ui) = mpsc::channel::<SignalVisuel>(256);
         let (tx_commandes, rx_commandes) = mpsc::unbounded_channel::<CommandeMoteur>();
         let (tx_statut, rx_statut) = mpsc::unbounded_channel::<(u64, NotificationMoteur)>();
-        tx_commandes.send(CommandeMoteur::Demarrer {
-            generation: 0,
-            mode: ModeExecution::TempsReel,
-            date_debut: String::new(),
-            date_fin: String::new(),
-            chemin_fichier: String::new(),
-            symboles_test: config.paires.symboles.clone(),
-            parametrages: parametrages.clone(),
-            fournisseurs: config.sources_donnees.fournisseurs.clone(),
-        })?;
-        let etat_initial = ipc::EtatServeur {
-            symboles: config.paires.symboles.clone(),
-            parametrages,
-            fournisseurs: config.sources_donnees.fournisseurs.clone(),
-            generation: 0,
-            mode: ModeExecution::TempsReel,
-            statut: None,
-            signaux: Vec::new(),
-            ressources: None,
-        };
+        tx_commandes.send(demarrage_initial(&config, &parametrages))?;
+        let initial = etat_initial(&config, &parametrages);
         let resultat = runtime.block_on(async {
             let listener = tokio::net::TcpListener::from_std(listener)?;
             runtime.spawn(moteur(
@@ -438,12 +423,18 @@ fn executer(_avec_arguments: bool) -> Result<(), Box<dyn std::error::Error>> {
             ));
             ipc::servir(
                 listener,
-                jeton,
-                etat_initial,
+                initial,
                 tx_commandes,
                 rx_ui,
                 rx_statut,
-                notificateur_telegram.clone(),
+                ipc::OptionsServeur {
+                    intervalle_ihm,
+                    notificateur_presence: notificateur_telegram.clone(),
+                    console: true,
+                },
+                async {
+                    let _ = tokio::signal::ctrl_c().await;
+                },
             )
             .await
         });
@@ -452,46 +443,73 @@ fn executer(_avec_arguments: bool) -> Result<(), Box<dyn std::error::Error>> {
         return resultat.map_err(|erreur| std::io::Error::other(erreur.to_string()).into());
     }
 
-    let jeton = charger_jeton()?;
     let adresse = arguments
         .connect
-        .unwrap_or_else(|| "127.0.0.1:8765".parse().expect("Adresse par défaut valide"));
-    let connexion = runtime
-        .block_on(ipc::connecter(&adresse.to_string(), jeton))
-        .map_err(|erreur| std::io::Error::other(erreur.to_string()))?;
-    let etat = connexion.etat;
-    let parametrages_ui = etat.parametrages.clone();
-    let symboles_ui = etat.symboles.clone();
-    let fournisseurs_ui = etat.fournisseurs.clone();
-    let generation = etat.generation;
-    let mode = etat.mode;
-    let signaux = etat.signaux;
-    let statut = etat.statut;
+        .unwrap_or_else(|| "127.0.0.1:8765".parse().expect("Adresse par défaut valide"))
+        .to_string();
+    let resultat = lancer_ihm(&config, parametrages, adresse.clone(), intervalle_ihm);
+    client::annoncer_fermeture(&runtime, &adresse);
+    runtime.shutdown_background();
+    resultat?;
+    Ok(())
+}
 
+/// Commande de démarrage du moteur au lancement : temps réel, génération 0.
+fn demarrage_initial(config: &ConfigurationApplication, parametrages: &Parametrages) -> CommandeMoteur {
+    CommandeMoteur::Demarrer {
+        generation: 0,
+        mode: ModeExecution::TempsReel,
+        date_debut: String::new(),
+        date_fin: String::new(),
+        chemin_fichier: String::new(),
+        symboles_test: config.paires.symboles.clone(),
+        parametrages: parametrages.clone(),
+        fournisseurs: config.sources_donnees.fournisseurs.clone(),
+    }
+}
+
+/// État de départ du serveur, cohérent avec `demarrage_initial`.
+fn etat_initial(config: &ConfigurationApplication, parametrages: &Parametrages) -> ipc::EtatInitial {
+    ipc::EtatInitial {
+        symboles: config.paires.symboles.clone(),
+        parametrages: parametrages.clone(),
+        fournisseurs: config.sources_donnees.fournisseurs.clone(),
+        mode: ModeExecution::TempsReel,
+    }
+}
+
+/// Ouvre la fenêtre de l'IHM, reliée au moteur par le thread réseau.
+///
+/// Entrées : configuration locale (réglages affichés en attendant le moteur), adresse du
+/// moteur et intervalle de lecture.
+/// Sortie : `Ok(())` à la fermeture de la fenêtre, ou erreur d'eframe.
+fn lancer_ihm(
+    config: &ConfigurationApplication,
+    parametrages: Parametrages,
+    adresse: String,
+    intervalle: Duration,
+) -> Result<(), eframe::Error> {
+    let fournisseurs = config.sources_donnees.fournisseurs.clone();
+    let symboles = config.paires.symboles.clone();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([900.0, 600.0]),
         ..Default::default()
     };
+    info!("IHM : moteur attendu sur {adresse}");
     eframe::run_native(
         "Crypto Trend Detector H24",
         options,
-        Box::new(move |_cc| {
-            Ok(Box::new(
-                ui::ApplicationCryptobot::new(
-                    connexion.rx_signaux,
-                    parametrages_ui,
-                    fournisseurs_ui,
-                    symboles_ui,
-                )
-                .avec_moteur(connexion.tx_commandes, connexion.rx_statut)
-                .avec_ressources(connexion.rx_ressources)
-                .avec_etat_initial(generation, mode, signaux, statut),
-            ))
+        Box::new(move |contexte| {
+            let egui_ctx = contexte.egui_ctx.clone();
+            let client = client::demarrer(adresse, intervalle, move || egui_ctx.request_repaint());
+            Ok(Box::new(ui::ApplicationCryptobot::new(
+                parametrages,
+                fournisseurs,
+                symboles,
+                client,
+            )))
         }),
-    )?;
-
-    runtime.shutdown_background();
-    Ok(())
+    )
 }
 
 fn notifier_arret_moteur(
@@ -510,20 +528,6 @@ fn notifier_arret_moteur(
             error!("Impossible d'attendre l'envoi de la notification d'arrêt Telegram : {erreur}");
         }
     });
-}
-
-/// Lit et valide le jeton partagé entre l'IHM et le moteur.
-///
-/// Entrée : variable d'environnement `PREDICT_TOKEN`.
-/// Sortie : jeton d'au moins 16 caractères ou erreur explicite.
-fn charger_jeton() -> Result<String, Box<dyn std::error::Error>> {
-    let jeton = std::env::var("PREDICT_TOKEN").map_err(
-        |_| "Définissez la variable d'environnement PREDICT_TOKEN sur le moteur et l'IHM",
-    )?;
-    if jeton.len() < 16 {
-        return Err("PREDICT_TOKEN doit contenir au moins 16 caractères".into());
-    }
-    Ok(jeton)
 }
 
 /// Convertit les options de mode de la ligne de commande en paramètres console.

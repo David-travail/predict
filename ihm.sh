@@ -5,7 +5,6 @@
 #   ./ihm.sh                     Se connecte à l'adresse par défaut (ou celle de .predict_connect)
 #   ./ihm.sh 192.168.1.10:8765   Se connecte au moteur indiqué
 #
-# Jeton : PREDICT_TOKEN dans l'environnement, sinon le fichier .predict_token à côté du script.
 # Adresse du moteur : argument, sinon PREDICT_CONNECT, sinon le fichier .predict_connect
 # (une ligne IP:PORT), sinon le défaut du programme (127.0.0.1:8765).
 # Exécutable : PREDICT_BIN, sinon target/release/predict, sinon target/debug/predict ;
@@ -29,14 +28,6 @@ erreur() {
     fi
     exit 1
 }
-
-# Jeton
-if [[ -z "${PREDICT_TOKEN:-}" && -f "$DOSSIER/.predict_token" ]]; then
-    PREDICT_TOKEN="$(head -n 1 "$DOSSIER/.predict_token" | tr -d '\r\n')"
-fi
-[[ -n "${PREDICT_TOKEN:-}" ]] || erreur "PREDICT_TOKEN non défini : écrivez le jeton dans $DOSSIER/.predict_token"
-(( ${#PREDICT_TOKEN} >= 16 )) || erreur "PREDICT_TOKEN doit contenir au moins 16 caractères."
-export PREDICT_TOKEN
 
 # Adresse du moteur
 ADRESSE="${1:-${PREDICT_CONNECT:-}}"
@@ -75,6 +66,6 @@ PID=$!
 
 sleep 2
 if ! kill -0 "$PID" 2>/dev/null; then
-    erreur "L'IHM s'est arrêtée au démarrage (moteur lancé ? jeton identique ?). Voir $FICHIER_CONSOLE"
+    erreur "L'IHM s'est arrêtée au démarrage. Voir $FICHIER_CONSOLE"
 fi
 echo "IHM lancée (PID $PID)${ADRESSE:+, connectée à $ADRESSE}."

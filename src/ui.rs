@@ -1,11 +1,17 @@
+use crate::client::{ClientMoteur, RetourReseau};
 use crate::config::{ConfigurationStrategie, Parametrages, Portee};
 use crate::core::modeles::Tendance;
 use crate::data::sources::Fournisseur;
+use crate::protocole::{
+    ContenuDossier, ContenuEvenement, EtatMoteur, ReponseMoteur, RequeteIhm, RessourcesServeur,
+};
 use chrono::{Datelike, Duration, NaiveDate};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::time::Instant;
-use tokio::sync::mpsc::{Receiver, UnboundedReceiver, UnboundedSender};
+
+/// Alertes conservées dans le journal affiché.
+const JOURNAL_ALERTES_MAX: usize = 5000;
 
 #[derive(Debug, PartialEq, Clone, Copy, Serialize, Deserialize)]
 pub enum ModeExecution {
@@ -208,9 +214,17 @@ fn afficher_calendrier(
     }
 }
 
+/// Fenêtre de parcours des dossiers de la machine du moteur.
+struct Navigateur {
+    contenu: Option<ContenuDossier>,
+    en_cours: bool,
+}
+
 pub struct ApplicationCryptobot {
-    pub rx_mpsc: Receiver<SignalVisuel>,
-    pub paires: HashMap<String, SignalVisuel>,
+    /// Canaux vers le thread réseau.
+    client: ClientMoteur,
+    /// Dernier signal de chaque paire, triées par symbole.
+    pub paires: BTreeMap<String, SignalVisuel>,
     pub journal_alertes: Vec<SignalVisuel>,
 
     // Nouveaux champs pour le choix du mode et le calibrage
@@ -237,52 +251,87 @@ pub struct ApplicationCryptobot {
     message_reglages: String,
     symboles_test_disponibles: Vec<String>,
     symboles_test: HashSet<String>,
-    pub generation: u64,
+    /// Instance du moteur connue (`None` tant qu'aucun état n'a été reçu).
+    instance: Option<u64>,
+    /// Génération affichée, attribuée par le moteur.
+    generation: Option<u64>,
+    /// Les états de génération inférieure sont ignorés (session remplacée par l'IHM).
+    generation_min: u64,
+    /// Vrai si la dernière lecture de l'état a réussi.
+    connecte: bool,
+    erreur_reseau: Option<String>,
+    /// Dernier statut reçu du moteur, pour ne reprendre que ses changements.
+    dernier_statut_moteur: Option<String>,
     pub statut: String,
     /// Alerte cliquée dans le journal : sa paire affiche les données de cette alerte.
     pub selection: Option<SignalVisuel>,
     /// Messages reçus du flux en direct depuis le lancement de la session.
     nb_messages: u64,
     dernier_message: Option<Instant>,
-    tx_commandes: Option<UnboundedSender<CommandeMoteur>>,
-    rx_statut: Option<UnboundedReceiver<(u64, NotificationMoteur)>>,
     /// Dernière occupation CPU/mémoire publiée par le serveur.
-    rx_ressources: Option<tokio::sync::watch::Receiver<Option<crate::ipc::RessourcesServeur>>>,
+    ressources: Option<RessourcesServeur>,
+    navigateur: Option<Navigateur>,
     erreur_dialogue: Option<String>,
 }
 
+/// Liste triée des paires proposées : celles suivies et celles qui ont un réglage propre.
+fn symboles_disponibles(symboles: &[String], parametrages: &Parametrages) -> Vec<String> {
+    let mut liste: Vec<String> = symboles
+        .iter()
+        .chain(parametrages.paires.keys())
+        .map(|s| s.to_uppercase())
+        .collect();
+    liste.sort_unstable();
+    liste.dedup();
+    liste
+}
+
+/// Dossier parent d'un chemin saisi, quel que soit le séparateur ; vide s'il n'y en a pas.
+fn dossier_de(chemin: &str) -> String {
+    match chemin.rfind(['/', '\\']) {
+        Some(0) => chemin[..1].to_string(),
+        Some(index) => chemin[..index].to_string(),
+        None => String::new(),
+    }
+}
+
+/// Joint un nom à un dossier du moteur avec le séparateur que ce dossier utilise.
+fn joindre(dossier: &str, nom: &str) -> String {
+    let separateur = if dossier.contains('\\') && !dossier.contains('/') {
+        '\\'
+    } else {
+        '/'
+    };
+    if dossier.ends_with(separateur) {
+        format!("{dossier}{nom}")
+    } else {
+        format!("{dossier}{separateur}{nom}")
+    }
+}
+
 impl ApplicationCryptobot {
-    /// Construit l'IHM avec les symboles, fournisseurs et paramétrages initiaux.
+    /// Construit l'IHM ; les réglages fournis servent jusqu'au premier état reçu du moteur.
     ///
-    /// Entrées : récepteur de signaux, paramétrages, fournisseurs et symboles suivis.
-    /// Sortie : application initialisée avec le mode temps réel sélectionné.
+    /// Entrées : paramétrages, fournisseurs et symboles par défaut, canaux du thread réseau.
+    /// Sortie : application initialisée, en attente du premier état du moteur.
     pub fn new(
-        rx_mpsc: Receiver<SignalVisuel>,
         parametrages: Parametrages,
         fournisseurs: Vec<Fournisseur>,
         symboles: Vec<String>,
+        client: ClientMoteur,
     ) -> Self {
-        let mut symboles_test_disponibles = symboles.clone();
-        symboles_test_disponibles.extend(parametrages.paires.keys().cloned());
-        symboles_test_disponibles = symboles_test_disponibles
-            .into_iter()
-            .map(|s| s.to_uppercase())
-            .collect();
-        symboles_test_disponibles.sort_unstable();
-        symboles_test_disponibles.dedup();
-
         Self {
             parametrages_sauvegardes: parametrages.clone(),
+            symboles_test: symboles.iter().map(|s| s.to_uppercase()).collect(),
+            symboles_test_disponibles: symboles_disponibles(&symboles, &parametrages),
             parametrages,
             fournisseurs,
             portee: Portee::Generique,
             presse_papiers: None,
             copie_vers: None,
             message_reglages: String::new(),
-            symboles_test: symboles.iter().map(|s| s.to_uppercase()).collect(),
-            symboles_test_disponibles,
-            rx_mpsc,
-            paires: HashMap::new(),
+            client,
+            paires: BTreeMap::new(),
             journal_alertes: Vec::new(),
             mode_actif: ModeExecution::TempsReel,
             date_debut: "2026-01-01".to_string(),
@@ -292,75 +341,140 @@ impl ApplicationCryptobot {
             calendrier_debut_ouvert: false,
             calendrier_fin_ouvert: false,
             chemin_fichier_test: "historique.json".to_string(),
-            generation: 0,
+            instance: None,
+            generation: None,
+            generation_min: 0,
+            connecte: false,
+            erreur_reseau: None,
+            dernier_statut_moteur: None,
             statut: String::new(),
             selection: None,
             nb_messages: 0,
             dernier_message: None,
-            tx_commandes: None,
-            rx_statut: None,
-            rx_ressources: None,
+            ressources: None,
+            navigateur: None,
             erreur_dialogue: None,
         }
     }
 
-    /// Branche l'IHM sur le moteur : envoi des commandes et réception des messages d'état.
-    ///
-    /// Entrées : canal d'envoi des commandes et récepteur des notifications du moteur.
-    /// Sortie : application configurée, renvoyée pour chaînage.
-    pub fn avec_moteur(
-        mut self,
-        tx_commandes: UnboundedSender<CommandeMoteur>,
-        rx_statut: UnboundedReceiver<(u64, NotificationMoteur)>,
-    ) -> Self {
-        self.tx_commandes = Some(tx_commandes);
-        self.rx_statut = Some(rx_statut);
-        self
-    }
-
-    /// Branche l'affichage de l'occupation CPU/mémoire du serveur.
-    ///
-    /// Entrées : récepteur des mesures périodiques envoyées par le serveur.
-    /// Sortie : application configurée, renvoyée pour chaînage.
-    pub fn avec_ressources(
-        mut self,
-        rx_ressources: tokio::sync::watch::Receiver<Option<crate::ipc::RessourcesServeur>>,
-    ) -> Self {
-        self.rx_ressources = Some(rx_ressources);
-        self
-    }
-
-    /// Initialise l'IHM depuis l'état reçu à la connexion au moteur.
-    ///
-    /// Entrées : génération et mode actifs, signaux initiaux et notification de statut éventuelle.
-    /// Sortie : application mise à jour, renvoyée pour chaînage; les éléments d'autres générations
-    /// sont ignorés.
-    pub fn avec_etat_initial(
-        mut self,
-        generation: u64,
-        mode: ModeExecution,
-        signaux: Vec<SignalVisuel>,
-        statut: Option<(u64, NotificationMoteur)>,
-    ) -> Self {
-        self.generation = generation;
-        self.mode_actif = mode;
-        for signal in signaux {
-            if signal.generation == generation {
-                self.paires.insert(signal.symbole.clone(), signal);
-            }
-        }
-        if let Some((generation_statut, notification)) = statut {
-            if generation_statut == generation {
-                match notification {
-                    NotificationMoteur::Statut(texte) => self.statut = texte,
-                    NotificationMoteur::Info(texte) => self.message_reglages = texte,
-                    NotificationMoteur::Erreur(texte) | NotificationMoteur::Echec(texte) => {
-                        self.erreur_dialogue = Some(texte);
+    /// Vide le canal des retours du thread réseau et met l'état à jour.
+    fn recevoir(&mut self) {
+        while let Ok(retour) = self.client.retours.try_recv() {
+            match retour {
+                RetourReseau::Etat(Ok(etat)) => self.appliquer_etat(etat),
+                RetourReseau::Etat(Err(erreur)) => {
+                    self.connecte = false;
+                    self.erreur_reseau = Some(erreur);
+                }
+                RetourReseau::Reponse(Ok(reponse)) => self.appliquer_reponse(reponse),
+                RetourReseau::Reponse(Err(erreur)) => {
+                    // La commande n'a pas abouti : la session affichée reste valable.
+                    self.generation_min = 0;
+                    if let Some(navigateur) = &mut self.navigateur {
+                        navigateur.en_cours = false;
                     }
+                    self.ajouter_erreur(erreur);
                 }
             }
         }
-        self
+    }
+
+    /// Remplace l'affichage par l'instantané reçu du moteur et intègre ses nouveaux événements.
+    fn appliquer_etat(&mut self, etat: EtatMoteur) {
+        self.connecte = true;
+        self.erreur_reseau = None;
+        self.ressources = etat.ressources;
+
+        if self.instance != Some(etat.instance) {
+            if self.instance.is_none() {
+                // Premier contact : les réglages du moteur remplacent ceux par défaut.
+                self.symboles_test_disponibles =
+                    symboles_disponibles(&etat.symboles, &etat.parametrages);
+                self.symboles_test = etat.symboles.iter().map(|s| s.to_uppercase()).collect();
+                self.parametrages_sauvegardes = etat.parametrages.clone();
+                self.parametrages = etat.parametrages.clone();
+            }
+            self.instance = Some(etat.instance);
+            self.generation = None;
+            self.generation_min = 0;
+        }
+        if etat.generation < self.generation_min {
+            return; // ancienne session, remplacée par une commande de cette IHM
+        }
+        if self.generation != Some(etat.generation) {
+            // Nouvelle session (lancée par cette IHM ou par une autre).
+            self.generation = Some(etat.generation);
+            self.mode_actif = etat.mode;
+            self.fournisseurs = etat.fournisseurs;
+            self.journal_alertes.clear();
+            self.selection = None;
+            self.dernier_statut_moteur = None;
+        }
+
+        self.paires = etat
+            .paires
+            .into_iter()
+            .map(|signal| (signal.symbole.clone(), signal))
+            .collect();
+        self.nb_messages = etat.nb_messages;
+        self.dernier_message = etat.dernier_message_il_y_a_ms.and_then(|ms| {
+            Instant::now().checked_sub(std::time::Duration::from_millis(ms))
+        });
+        if etat.statut != self.dernier_statut_moteur {
+            if let Some(statut) = &etat.statut {
+                self.statut = statut.clone();
+            }
+            self.dernier_statut_moteur = etat.statut;
+        }
+        for evenement in etat.evenements {
+            match evenement.contenu {
+                ContenuEvenement::Alerte(signal) => {
+                    self.journal_alertes.insert(0, signal);
+                    self.journal_alertes.truncate(JOURNAL_ALERTES_MAX);
+                }
+                ContenuEvenement::Info(texte) => self.message_reglages = texte,
+                ContenuEvenement::Erreur(texte) | ContenuEvenement::Echec(texte) => {
+                    self.ajouter_erreur(texte);
+                }
+            }
+        }
+    }
+
+    /// Traite la réponse du moteur à une requête de l'IHM.
+    fn appliquer_reponse(&mut self, reponse: ReponseMoteur) {
+        match reponse {
+            ReponseMoteur::Resultat {
+                succes: true,
+                generation: Some(generation),
+                ..
+            } => self.generation_min = generation,
+            ReponseMoteur::Resultat { succes: true, .. } => {}
+            ReponseMoteur::Resultat {
+                succes: false,
+                message,
+                ..
+            } => {
+                self.generation_min = 0;
+                self.ajouter_erreur(message);
+            }
+            ReponseMoteur::ContenuDossier(contenu) => {
+                if let Some(navigateur) = &mut self.navigateur {
+                    navigateur.contenu = Some(contenu);
+                    navigateur.en_cours = false;
+                }
+            }
+            ReponseMoteur::Etat(_) => {}
+        }
+    }
+
+    /// Ajoute un message à la fenêtre d'erreur (ouverte si besoin).
+    fn ajouter_erreur(&mut self, texte: String) {
+        if let Some(erreur) = &mut self.erreur_dialogue {
+            erreur.push('\n');
+            erreur.push_str(&texte);
+        } else {
+            self.erreur_dialogue = Some(texte);
+        }
     }
 
     /// Efface toutes les valeurs affichées et invalide les signaux encore en transit.
@@ -368,25 +482,127 @@ impl ApplicationCryptobot {
     /// Entrée : état courant de l'application.
     /// Sortie : incrémente la génération et vide les données d'affichage.
     fn reinitialiser(&mut self) {
-        self.generation += 1;
+        // Les états de la session courante qui arrivent encore sont ignorés.
+        self.generation_min = self.generation.map_or(0, |g| g + 1);
         self.paires.clear();
         self.journal_alertes.clear();
         self.selection = None;
         self.statut.clear();
         self.nb_messages = 0;
         self.dernier_message = None;
-        while self.rx_mpsc.try_recv().is_ok() {}
     }
 
-    /// Envoie une commande au moteur si le canal est connecté.
+    /// Transmet une requête au thread réseau.
     ///
-    /// Entrée : commande moteur.
-    /// Sortie : transmet la commande ou affiche un statut si le moteur n'est plus connecté.
-    fn envoyer(&mut self, commande: CommandeMoteur) {
-        if let Some(tx) = &self.tx_commandes {
-            if tx.send(commande).is_err() {
-                self.statut = "Connexion au moteur perdue.".to_string();
-            }
+    /// Entrée : requête pour le moteur.
+    /// Sortie : `true` si elle part ; sinon le statut signale que le moteur est injoignable.
+    fn envoyer(&mut self, requete: RequeteIhm) -> bool {
+        if !self.connecte {
+            self.statut = "Moteur injoignable : commande non envoyée.".to_string();
+            return false;
+        }
+        if self.client.requetes.send(requete).is_err() {
+            self.statut = "Thread réseau arrêté : redémarrez l'IHM.".to_string();
+            return false;
+        }
+        true
+    }
+
+    /// Ouvre (ou met à jour) le navigateur sur un dossier de la machine du moteur.
+    ///
+    /// Entrée : chemin du dossier ; vide = dossier de travail du moteur.
+    fn parcourir(&mut self, chemin: String) {
+        let navigateur = self.navigateur.get_or_insert(Navigateur {
+            contenu: None,
+            en_cours: false,
+        });
+        navigateur.en_cours = true;
+        if !self.envoyer(RequeteIhm::ListerDossier { chemin })
+            && let Some(navigateur) = &mut self.navigateur
+        {
+            navigateur.en_cours = false;
+        }
+    }
+
+    /// Affiche la fenêtre de choix d'un fichier `.json` sur la machine du moteur.
+    ///
+    /// Entrée : contexte egui.
+    /// Sortie : met à jour le chemin du fichier de test ou demande un autre dossier.
+    fn afficher_navigateur(&mut self, ctx: &egui::Context) {
+        let Some(navigateur) = &self.navigateur else {
+            return;
+        };
+        let mut ouverte = true;
+        let mut aller_vers: Option<String> = None;
+        let mut fichier_choisi: Option<String> = None;
+        egui::Window::new("Fichiers du moteur")
+            .id(egui::Id::new("navigateur_moteur"))
+            .open(&mut ouverte)
+            .collapsible(false)
+            .default_size([520.0, 400.0])
+            .show(ctx, |ui| {
+                let contenu = navigateur.contenu.as_ref();
+                ui.horizontal(|ui| {
+                    let parent = contenu.and_then(|c| c.parent.clone());
+                    if ui
+                        .add_enabled(parent.is_some(), egui::Button::new("⬆ Parent"))
+                        .clicked()
+                    {
+                        aller_vers = parent;
+                    }
+                    if ui
+                        .button("🏠 Dossier du moteur")
+                        .on_hover_text("Dossier de travail du moteur")
+                        .clicked()
+                    {
+                        aller_vers = Some(String::new());
+                    }
+                    if navigateur.en_cours {
+                        ui.spinner();
+                    }
+                });
+                let Some(contenu) = contenu else {
+                    ui.label("Lecture du dossier…");
+                    return;
+                };
+                ui.label(egui::RichText::new(&contenu.chemin).monospace());
+                if let Some(erreur) = &contenu.erreur {
+                    ui.label(egui::RichText::new(erreur).color(egui::Color32::LIGHT_RED));
+                }
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for dossier in &contenu.dossiers {
+                            if ui.selectable_label(false, format!("📁 {dossier}")).clicked() {
+                                aller_vers = Some(joindre(&contenu.chemin, dossier));
+                            }
+                        }
+                        for fichier in &contenu.fichiers_json {
+                            if ui.selectable_label(false, format!("📄 {fichier}")).clicked() {
+                                fichier_choisi = Some(joindre(&contenu.chemin, fichier));
+                            }
+                        }
+                        if contenu.erreur.is_none()
+                            && contenu.dossiers.is_empty()
+                            && contenu.fichiers_json.is_empty()
+                        {
+                            ui.label("Aucun sous-dossier ni fichier .json.");
+                        }
+                        if contenu.tronque {
+                            ui.label(
+                                egui::RichText::new("Liste tronquée.").color(egui::Color32::GRAY),
+                            );
+                        }
+                    });
+            });
+        if let Some(chemin) = fichier_choisi {
+            self.chemin_fichier_test = chemin;
+            self.navigateur = None;
+        } else if !ouverte {
+            self.navigateur = None;
+        } else if let Some(chemin) = aller_vers {
+            self.parcourir(chemin);
         }
     }
 
@@ -400,8 +616,7 @@ impl ApplicationCryptobot {
         match self.mode_actif {
             ModeExecution::TempsReel | ModeExecution::Simulation => self.lancer(),
             ModeExecution::BacktestPeriode | ModeExecution::BacktestFichier => {
-                self.envoyer(CommandeMoteur::Arreter {
-                    generation: self.generation,
+                let _ = self.envoyer(RequeteIhm::Arreter {
                     mode: self.mode_actif,
                 });
                 self.statut =
@@ -415,8 +630,7 @@ impl ApplicationCryptobot {
     /// Entrée : état courant de l'IHM.
     /// Sortie : transmet une commande de démarrage via le canal configuré.
     fn lancer(&mut self) {
-        self.envoyer(CommandeMoteur::Demarrer {
-            generation: self.generation,
+        let _ = self.envoyer(RequeteIhm::Demarrer {
             mode: self.mode_actif,
             date_debut: self.date_debut.clone(),
             date_fin: self.date_fin.clone(),
@@ -472,11 +686,13 @@ impl ApplicationCryptobot {
                     self.erreur_dialogue = Some(format!("Réglages invalides : {erreur}"));
                     return;
                 }
-                self.message_reglages = "Sauvegarde en cours...".to_string();
-                self.parametrages_sauvegardes = self.parametrages.clone();
-                self.envoyer(CommandeMoteur::SauvegarderParametrages {
+                let envoyee = self.envoyer(RequeteIhm::SauvegarderParametrages {
                     parametrages: self.parametrages.clone(),
                 });
+                if envoyee {
+                    self.message_reglages = "Sauvegarde en cours...".to_string();
+                    self.parametrages_sauvegardes = self.parametrages.clone();
+                }
             }
         }
     }
@@ -656,7 +872,7 @@ fn editeur_indicateurs(
 }
 
 /// Formate l'occupation du serveur pour l'en-tête (ex. « 🖥 Serveur : CPU 1.2 % · RAM 48 Mo (0.3 %) »).
-fn texte_ressources(r: &crate::ipc::RessourcesServeur) -> String {
+fn texte_ressources(r: &RessourcesServeur) -> String {
     let memoire_mo = r.memoire_octets as f64 / (1024.0 * 1024.0);
     let memoire = if memoire_mo >= 1024.0 {
         format!("{:.2} Go", memoire_mo / 1024.0)
@@ -682,42 +898,8 @@ impl eframe::App for ApplicationCryptobot {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
 
-        // 1. Réception des signaux du moteur Tokio
-        while let Ok(signal) = self.rx_mpsc.try_recv() {
-            if signal.generation != self.generation {
-                continue;
-            }
-            // Les signaux d'amorçage (avant l'ouverture du flux) ne comptent pas.
-            if self.statut.starts_with('🔴') || self.statut.starts_with('🟡') {
-                self.nb_messages += 1;
-                self.dernier_message = Some(Instant::now());
-            }
-            if signal.est_alerte {
-                self.journal_alertes.insert(0, signal.clone());
-                if self.journal_alertes.len() > 5000 {
-                    self.journal_alertes.pop();
-                }
-            }
-            self.paires.insert(signal.symbole.clone(), signal);
-        }
-        if let Some(rx) = &mut self.rx_statut {
-            while let Ok((generation, notification)) = rx.try_recv() {
-                if generation == self.generation {
-                    match notification {
-                        NotificationMoteur::Statut(texte) => self.statut = texte,
-                        NotificationMoteur::Info(texte) => self.message_reglages = texte,
-                        NotificationMoteur::Erreur(texte) | NotificationMoteur::Echec(texte) => {
-                            if let Some(erreur) = &mut self.erreur_dialogue {
-                                erreur.push('\n');
-                                erreur.push_str(&texte);
-                            } else {
-                                self.erreur_dialogue = Some(texte);
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        // 1. Réception des états et réponses du moteur
+        self.recevoir();
 
         if let Some(erreur) = self.erreur_dialogue.clone() {
             let mut fermer = false;
@@ -736,14 +918,20 @@ impl eframe::App for ApplicationCryptobot {
             }
         }
 
-        ctx.request_repaint();
+        // Le thread réseau réveille l'IHM à chaque retour ; ce délai fait avancer l'âge affiché.
+        ctx.request_repaint_after(std::time::Duration::from_secs(1));
 
         let mode_avant = self.mode_actif;
+        let mut parcourir: Option<String> = None;
         let mut lancer_test = false;
         let mut fournisseurs_modifies = false;
 
         // 2. BARRE SUPÉRIEURE : Sélection du mode & Seuil
         egui::Panel::top("en_tete").show(ui, |ui| {
+            // Commandes grisées tant que le moteur ne répond pas.
+            if !self.connecte {
+                ui.disable();
+            }
             ui.horizontal(|ui| {
                 ui.heading("⚡ Détecteur de Tendances Crypto H24");
                 ui.separator();
@@ -878,19 +1066,12 @@ impl eframe::App for ApplicationCryptobot {
                         ui.horizontal_wrapped(|ui| {
                             ui.label("Chemin fichier test :");
                             ui.text_edit_singleline(&mut self.chemin_fichier_test);
-                            if ui.button("📂 Parcourir...").clicked() {
-                                let mut dialogue =
-                                    rfd::FileDialog::new().add_filter("Historique JSON", &["json"]);
-                                if let Some(dossier) =
-                                    std::path::Path::new(&self.chemin_fichier_test)
-                                        .parent()
-                                        .filter(|d| d.is_dir())
-                                {
-                                    dialogue = dialogue.set_directory(dossier);
-                                }
-                                if let Some(chemin) = dialogue.pick_file() {
-                                    self.chemin_fichier_test = chemin.display().to_string();
-                                }
+                            if ui
+                                .button("📂 Parcourir...")
+                                .on_hover_text("Fichiers de la machine du moteur")
+                                .clicked()
+                            {
+                                parcourir = Some(dossier_de(&self.chemin_fichier_test));
                             }
                         });
                     }
@@ -1080,6 +1261,11 @@ impl eframe::App for ApplicationCryptobot {
             }
         }
 
+        if let Some(chemin) = parcourir {
+            self.parcourir(chemin);
+        }
+        self.afficher_navigateur(&ctx);
+
         afficher_calendrier(
             &ctx,
             "Choisir la date de début",
@@ -1180,14 +1366,22 @@ impl eframe::App for ApplicationCryptobot {
         egui::CentralPanel::default().show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("📊 Paires Surveillées en Temps Réel");
-                let ressources = self.rx_ressources.as_ref().and_then(|rx| *rx.borrow());
-                if let Some(r) = ressources {
+                if let Some(r) = self.ressources {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(texte_ressources(&r))
                             .on_hover_text("Occupation du processus serveur (mise à jour toutes les 2 s)");
                     });
                 }
             });
+            if let Some(erreur) = &self.erreur_reseau {
+                ui.label(
+                    egui::RichText::new(format!("⚠ {erreur} — nouvelle tentative…"))
+                        .strong()
+                        .color(egui::Color32::LIGHT_RED),
+                );
+            } else if self.instance.is_none() {
+                ui.label(egui::RichText::new("Connexion au moteur…").color(egui::Color32::GRAY));
+            }
             if !self.statut.is_empty() {
                 ui.label(
                     egui::RichText::new(&self.statut).color(egui::Color32::from_rgb(90, 60, 0)),
