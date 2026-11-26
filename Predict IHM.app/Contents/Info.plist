@@ -8,5 +8,6 @@
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleVersion</key><string>1.0</string>
     <key>LSUIElement</key><true/>
+    <key>NSLocalNetworkUsageDescription</key><string>Predict IHM se connecte au moteur predict sur le réseau local.</string>
 </dict>
 </plist>
