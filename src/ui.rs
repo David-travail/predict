@@ -1,5 +1,5 @@
 use crate::client::{ClientMoteur, RetourReseau};
-use crate::config::{ConfigurationStrategie, Parametrages, Portee};
+use crate::config::{ChoixNotifications, ConfigurationStrategie, Parametrages, Portee};
 use crate::core::modeles::Tendance;
 use crate::data::sources::Fournisseur;
 use crate::protocole::{
@@ -272,6 +272,13 @@ pub struct ApplicationCryptobot {
     ressources: Option<RessourcesServeur>,
     navigateur: Option<Navigateur>,
     erreur_dialogue: Option<String>,
+    /// Notifications Telegram cochées dans l'IHM.
+    notifications: ChoixNotifications,
+    /// Dernier choix publié par le moteur, pour ne reprendre que ses changements (une
+    /// lecture partie avant l'envoi d'un nouveau choix ne doit pas le décocher).
+    notifications_moteur: Option<ChoixNotifications>,
+    /// Vrai si le moteur a un jeton et un chat Telegram.
+    telegram_configure: bool,
 }
 
 /// Liste triée des paires proposées : celles suivies et celles qui ont un réglage propre.
@@ -354,6 +361,9 @@ impl ApplicationCryptobot {
             ressources: None,
             navigateur: None,
             erreur_dialogue: None,
+            notifications: ChoixNotifications::default(),
+            notifications_moteur: None,
+            telegram_configure: false,
         }
     }
 
@@ -384,6 +394,11 @@ impl ApplicationCryptobot {
         self.connecte = true;
         self.erreur_reseau = None;
         self.ressources = etat.ressources;
+        self.telegram_configure = etat.telegram_configure;
+        if self.notifications_moteur != Some(etat.notifications) {
+            self.notifications = etat.notifications;
+            self.notifications_moteur = Some(etat.notifications);
+        }
 
         if self.instance != Some(etat.instance) {
             if self.instance.is_none() {
@@ -506,6 +521,39 @@ impl ApplicationCryptobot {
             return false;
         }
         true
+    }
+
+    /// Menu de choix des notifications Telegram ; chaque changement est envoyé au moteur, qui
+    /// l'applique et l'enregistre dans son `config.toml`.
+    fn menu_notifications(&mut self, ui: &mut egui::Ui) {
+        ui.menu_button("🔔 Telegram", |ui| {
+            if !self.telegram_configure {
+                ui.label(
+                    egui::RichText::new(
+                        "Telegram non configuré sur le moteur :\nle choix est enregistré, rien n'est envoyé.",
+                    )
+                    .weak(),
+                );
+                ui.separator();
+            }
+            let mut choix = self.notifications;
+            let mut modifie = false;
+            for (coche, libelle) in [
+                (&mut choix.demarrage, "🚀 Démarrage du moteur"),
+                (&mut choix.arret, "🛑 Arrêt du moteur"),
+                (&mut choix.presence_ihm, "🖥 Connexion / déconnexion des IHM"),
+                (&mut choix.retournements, "🔄 Retournements de tendance"),
+            ] {
+                modifie |= ui.checkbox(coche, libelle).changed();
+            }
+            if modifie
+                && self.envoyer(RequeteIhm::ChoisirNotifications {
+                    notifications: choix,
+                })
+            {
+                self.notifications = choix;
+            }
+        });
     }
 
     /// Ouvre (ou met à jour) le navigateur sur un dossier de la machine du moteur.
@@ -990,6 +1038,9 @@ impl eframe::App for ApplicationCryptobot {
                             "📁 Fichier Local (JSON)",
                         );
                     });
+
+                ui.separator();
+                self.menu_notifications(ui);
             });
 
             if self.mode_actif == ModeExecution::TempsReel {

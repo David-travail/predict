@@ -41,6 +41,96 @@ pub struct ConfigurationTelegram {
     pub jeton_bot: String,
     #[serde(rename = "chat_id")]
     pub identifiant_chat: String,
+    /// Notifications envoyées (`[telegram.notifications]`), choisies depuis l'IHM.
+    pub notifications: ChoixNotifications,
+}
+
+/// Types de notifications Telegram à envoyer (section `[telegram.notifications]`).
+///
+/// Absent du fichier : tout est envoyé.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ChoixNotifications {
+    /// « Moteur démarré » à chaque lancement d'un mode.
+    #[serde(rename = "engine_start")]
+    pub demarrage: bool,
+    /// « Moteur arrêté » à l'arrêt du processus.
+    #[serde(rename = "engine_stop")]
+    pub arret: bool,
+    /// Connexion et déconnexion des IHM (mode `--serve`).
+    #[serde(rename = "ui_connection")]
+    pub presence_ihm: bool,
+    /// Retournements de tendance en temps réel.
+    #[serde(rename = "trend_reversal")]
+    pub retournements: bool,
+}
+
+impl Default for ChoixNotifications {
+    fn default() -> Self {
+        Self {
+            demarrage: true,
+            arret: true,
+            presence_ihm: true,
+            retournements: true,
+        }
+    }
+}
+
+impl ChoixNotifications {
+    /// Enregistre le choix dans la section `[telegram.notifications]` d'un `config.toml`
+    /// existant, sans toucher au reste du fichier (commentaires conservés).
+    ///
+    /// Entrée : chemin du fichier de configuration.
+    /// Sortie : `Ok(())` après écriture atomique (fichier temporaire puis renommage), sinon
+    /// une erreur de lecture, de parsing ou d'écriture.
+    pub fn enregistrer(&self, chemin: &Path) -> Result<(), Box<dyn Error>> {
+        let contenu = fs::read_to_string(chemin)
+            .map_err(|erreur| format!("Impossible de lire '{}': {erreur}", chemin.display()))?;
+        let nouveau = self.inserer_dans(&contenu).map_err(|erreur| {
+            format!("Erreur de parsing TOML dans '{}': {erreur}", chemin.display())
+        })?;
+        let temporaire = chemin.with_extension("toml.tmp");
+        fs::write(&temporaire, nouveau)?;
+        fs::rename(&temporaire, chemin)?;
+        Ok(())
+    }
+
+    /// Remplace le choix dans un contenu TOML.
+    ///
+    /// Entrée : contenu de `config.toml`.
+    /// Sortie : contenu modifié, ou erreur si le contenu n'est pas du TOML valide.
+    fn inserer_dans(&self, contenu: &str) -> Result<String, Box<dyn Error>> {
+        let mut document: toml_edit::DocumentMut = contenu.parse()?;
+        let telegram = document
+            .entry("telegram")
+            .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()))
+            .as_table_mut()
+            .ok_or("'telegram' n'est pas une table")?;
+        let notifications = telegram
+            .entry("notifications")
+            .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()))
+            .as_table_mut()
+            .ok_or("'telegram.notifications' n'est pas une table")?;
+        for (cle, valeur) in [
+            ("engine_start", self.demarrage),
+            ("engine_stop", self.arret),
+            ("ui_connection", self.presence_ihm),
+            ("trend_reversal", self.retournements),
+        ] {
+            // Remplace la valeur en gardant le commentaire éventuel de la ligne.
+            match notifications.get_mut(cle).and_then(toml_edit::Item::as_value_mut) {
+                Some(existante) => {
+                    let decor = existante.decor().clone();
+                    *existante = toml_edit::Value::from(valeur);
+                    *existante.decor_mut() = decor;
+                }
+                None => {
+                    notifications.insert(cle, toml_edit::value(valeur));
+                }
+            }
+        }
+        Ok(document.to_string())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -769,6 +859,36 @@ mod tests {
 
         let incomplet = toml.replace("chat_id = \"12345\"", "chat_id = \"\"");
         assert!(ConfigurationApplication::depuis_toml(&incomplet).is_err());
+    }
+
+    #[test]
+    fn enregistre_le_choix_des_notifications_en_gardant_le_reste() {
+        let reelle = include_str!("../config.toml");
+        let choix = ChoixNotifications {
+            demarrage: false,
+            retournements: false,
+            ..ChoixNotifications::default()
+        };
+        let modifiee = choix.inserer_dans(reelle).unwrap();
+        let relue = ConfigurationApplication::depuis_toml(&modifiee).unwrap();
+        assert_eq!(relue.telegram.notifications, choix);
+        // Seules les deux valeurs changent ; commentaires et alignement restent.
+        let differences: Vec<_> = reelle
+            .lines()
+            .zip(modifiee.lines())
+            .filter(|(a, b)| a != b)
+            .collect();
+        assert_eq!(differences.len(), 2, "{differences:?}");
+        assert!(differences[0].1.starts_with("engine_start = false    #"));
+        assert_eq!(reelle.lines().count(), modifiee.lines().count());
+
+        // Section absente : elle est ajoutée.
+        let sans_section = choix.inserer_dans(toml_exemple()).unwrap();
+        let relue = ConfigurationApplication::depuis_toml(&sans_section).unwrap();
+        assert_eq!(relue.telegram.notifications, choix);
+        // Absente du fichier : tout est envoyé.
+        let defaut = ConfigurationApplication::depuis_toml(toml_exemple()).unwrap();
+        assert_eq!(defaut.telegram.notifications, ChoixNotifications::default());
     }
 
     #[test]

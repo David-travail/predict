@@ -18,7 +18,7 @@ use crate::data::rest::{telecharger_bougies_periode, telecharger_plage_bougies};
 use crate::data::simulation::{generer_historique_fictif, simuler_flux_temps_reel};
 use crate::data::sources::{Agregateur, BougieSourcee, Fournisseur, agreger_historique};
 use crate::data::telegram::{
-    ConfigurationTelegram as ConfigurationCanalTelegram, NotificateurTelegram,
+    ConfigurationTelegram as ConfigurationCanalTelegram, NotificateurTelegram, TypeNotification,
 };
 use crate::data::websocket::ecouter_flux_temps_reel;
 use crate::indicators::adx::calculer_adx;
@@ -113,7 +113,7 @@ fn chercher_config() -> Option<PathBuf> {
 fn charger_configuration(
     demandee: Option<&PathBuf>,
 ) -> Result<ConfigurationApplication, Box<dyn std::error::Error>> {
-    let (mut config, dossier) = match demandee.cloned().or_else(chercher_config) {
+    let (mut config, dossier) = match chemin_configuration(demandee) {
         Some(chemin) => {
             info!("Configuration : {}", chemin.display());
             let dossier = chemin
@@ -135,14 +135,20 @@ fn charger_configuration(
     Ok(config)
 }
 
+/// Détermine le fichier de configuration utilisé (demandé ou découvert sur disque).
+///
+/// Entrée : chemin optionnel fourni en ligne de commande.
+/// Sortie : chemin du `config.toml`, ou `None` si la configuration intégrée est utilisée.
+fn chemin_configuration(demandee: Option<&PathBuf>) -> Option<PathBuf> {
+    demandee.cloned().or_else(chercher_config)
+}
+
 /// Détermine le chemin du fichier de sauvegarde des paramétrages.
 ///
 /// Entrée : chemin optionnel de la configuration.
 /// Sortie : chemin `parametres.toml` placé à côté de la configuration, ou dans le dossier courant.
 fn chemin_parametrages(demandee: Option<&PathBuf>) -> PathBuf {
-    demandee
-        .cloned()
-        .or_else(chercher_config)
+    chemin_configuration(demandee)
         .and_then(|c| c.parent().map(|p| p.join("parametres.toml")))
         .unwrap_or_else(|| PathBuf::from("parametres.toml"))
 }
@@ -316,7 +322,8 @@ fn executer(_avec_arguments: bool) -> Result<(), Box<dyn std::error::Error>> {
     let runtime = tokio::runtime::Runtime::new()?;
     let notificateur_telegram = if arguments.local || arguments.console || arguments.serve {
         let _runtime_guard = runtime.enter();
-        configuration_telegram(&config).map(ConfigurationCanalTelegram::demarrer)
+        configuration_telegram(&config)
+            .map(|canal| canal.demarrer(config.telegram.notifications))
     } else {
         None
     };
@@ -344,6 +351,14 @@ fn executer(_avec_arguments: bool) -> Result<(), Box<dyn std::error::Error>> {
         ));
         let _garde = runtime.enter();
         let listener = tokio::net::TcpListener::from_std(listener)?;
+        let options = ipc::OptionsServeur {
+            intervalle_ihm,
+            notificateur: notificateur_telegram.clone(),
+            // IHM dans le même processus : sa présence n'est pas notifiée.
+            presence_ihm: false,
+            chemin_config: chemin_configuration(arguments.config.as_ref()),
+            console: false,
+        };
         runtime.spawn(async move {
             let resultat = ipc::servir(
                 listener,
@@ -351,11 +366,7 @@ fn executer(_avec_arguments: bool) -> Result<(), Box<dyn std::error::Error>> {
                 tx_commandes,
                 rx_ui,
                 rx_statut,
-                ipc::OptionsServeur {
-                    intervalle_ihm,
-                    notificateur_presence: None,
-                    console: false,
-                },
+                options,
                 std::future::pending(),
             )
             .await;
@@ -429,7 +440,9 @@ fn executer(_avec_arguments: bool) -> Result<(), Box<dyn std::error::Error>> {
                 rx_statut,
                 ipc::OptionsServeur {
                     intervalle_ihm,
-                    notificateur_presence: notificateur_telegram.clone(),
+                    notificateur: notificateur_telegram.clone(),
+                    presence_ihm: true,
+                    chemin_config: chemin_configuration(arguments.config.as_ref()),
                     console: true,
                 },
                 async {
@@ -475,6 +488,8 @@ fn etat_initial(config: &ConfigurationApplication, parametrages: &Parametrages) 
         parametrages: parametrages.clone(),
         fournisseurs: config.sources_donnees.fournisseurs.clone(),
         mode: ModeExecution::TempsReel,
+        notifications: config.telegram.notifications,
+        telegram_configure: configuration_telegram(config).is_some(),
     }
 }
 
@@ -520,7 +535,8 @@ fn notifier_arret_moteur(
         return;
     };
     runtime.block_on(async {
-        if let Err(erreur) = notificateur.notifier("🛑 Moteur arrêté.".into()).await {
+        if let Err(erreur) = notificateur
+            .notifier(TypeNotification::Arret, "🛑 Moteur arrêté.".into()).await {
             error!("Impossible d'ajouter la notification d'arrêt Telegram : {erreur}");
             return;
         }
@@ -674,7 +690,10 @@ async fn moteur(
 
         if let Some(notificateur) = &notificateur
             && let Err(erreur) = notificateur
-                .notifier(format!("🚀 Moteur démarré\nMode : {}", libelle_mode(mode)))
+                .notifier(
+                    TypeNotification::Demarrage,
+                    format!("🚀 Moteur démarré\nMode : {}", libelle_mode(mode)),
+                )
                 .await
         {
             error!("Impossible d'envoyer la notification de démarrage : {erreur}");
@@ -1247,7 +1266,9 @@ impl Contexte {
                         "🔄 Retournement de tendance en {direction}\nPaire : {}\nPériode : {}\nPrix : {:.8}\nScore : {}/100\nHeure : {}",
                         signal.symbole, signal.unite, signal.prix, signal.score, signal.horodatage
                     );
-                    if let Err(erreur) = notificateur.notifier(message).await {
+                    if let Err(erreur) = notificateur
+                        .notifier(TypeNotification::Retournement, message)
+                        .await {
                         error!("Impossible d'envoyer l'alerte de retournement Telegram : {erreur}");
                     }
                 }

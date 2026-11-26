@@ -4,7 +4,7 @@
 //! par une ligne JSON (`ReponseMoteur`) puis ferme. Le moteur ne pousse rien : l'IHM interroge
 //! périodiquement avec `LireEtat`.
 
-use crate::config::Parametrages;
+use crate::config::{ChoixNotifications, Parametrages};
 use crate::data::sources::Fournisseur;
 use crate::ui::{ModeExecution, SignalVisuel};
 use serde::{Deserialize, Serialize};
@@ -37,6 +37,8 @@ pub enum RequeteIhm {
     /// Arrête la session et sélectionne un mode sans le démarrer (modes de test).
     Arreter { mode: ModeExecution },
     SauvegarderParametrages { parametrages: Parametrages },
+    /// Choisit les notifications Telegram ; appliqué aussitôt et enregistré dans `config.toml`.
+    ChoisirNotifications { notifications: ChoixNotifications },
     /// Liste un dossier de la machine du moteur ; vide = son dossier de travail.
     ListerDossier { chemin: String },
     /// L'IHM annonce sa fermeture.
@@ -98,6 +100,12 @@ pub struct EtatMoteur {
     pub suite: bool,
     #[serde(default)]
     pub ressources: Option<RessourcesServeur>,
+    /// Notifications Telegram envoyées.
+    #[serde(default)]
+    pub notifications: ChoixNotifications,
+    /// Vrai si le moteur a un jeton et un chat Telegram (sinon rien n'est envoyé).
+    #[serde(default)]
+    pub telegram_configure: bool,
 }
 
 /// Événement du journal du serveur, à ne pas manquer entre deux lectures.
@@ -242,6 +250,12 @@ mod tests {
             RequeteIhm::SauvegarderParametrages {
                 parametrages: config.parametrages(),
             },
+            RequeteIhm::ChoisirNotifications {
+                notifications: ChoixNotifications {
+                    arret: false,
+                    ..ChoixNotifications::default()
+                },
+            },
             RequeteIhm::ListerDossier {
                 chemin: String::new(),
             },
@@ -286,6 +300,11 @@ mod tests {
                 memoire_octets: 10,
                 memoire_totale_octets: 100,
             }),
+            notifications: ChoixNotifications {
+                retournements: false,
+                ..ChoixNotifications::default()
+            },
+            telegram_configure: true,
         });
         let ReponseMoteur::Etat(relu) = aller_retour(&etat) else {
             panic!("variante perdue");
@@ -294,6 +313,8 @@ mod tests {
         assert_eq!(relu.paires[0].symbole, "BTCEUR");
         assert_eq!(relu.evenements.len(), 2);
         assert_eq!(relu.ressources.unwrap().memoire_octets, 10);
+        assert!(!relu.notifications.retournements && relu.notifications.demarrage);
+        assert!(relu.telegram_configure);
 
         let resultat = ReponseMoteur::Resultat {
             succes: true,

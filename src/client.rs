@@ -212,6 +212,8 @@ mod tests {
                 .collect(),
             suite,
             ressources: None,
+            notifications: Default::default(),
+            telegram_configure: false,
         }
     }
 

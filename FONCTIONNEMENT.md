@@ -60,10 +60,20 @@ chat_id = "identifiant de la conversation"
 
 Le fichier de configuration pouvant contenir le secret du bot, ne pas versionner un jeton réel.
 
+Chaque type de notification (démarrage, arrêt, connexion/déconnexion des IHM, retournements de tendance) se coche dans l'IHM, menu « 🔔 Telegram » de la barre supérieure. Le choix est envoyé au moteur (requête `ChoisirNotifications`), appliqué aussitôt et enregistré dans la section `[telegram.notifications]` du `config.toml` du moteur (réécrite avec `toml_edit` : commentaires et reste du fichier conservés, écriture atomique). Section ou clé absente : la notification est envoyée. Si le moteur tourne sur sa configuration intégrée (pas de `config.toml`), le choix s'applique jusqu'à son arrêt et l'IHM signale qu'il n'a pas pu être enregistré.
+
+```toml
+[telegram.notifications]
+engine_start = true    # « Moteur démarré »
+engine_stop = true     # « Moteur arrêté »
+ui_connection = true   # connexion / déconnexion des IHM (mode --serve)
+trend_reversal = true  # retournements de tendance en temps réel
+```
+
 - **Connexion moteur–IHM** (contrat : `src/protocole.rs`, serveur : `src/ipc.rs`, client : `src/client.rs` ; modèle détaillé dans `COMMUNICATION_IHM_MOTEUR.md`) :
   1. Démarrer le moteur avec `predict --serve`, puis lancer l'IHM avec `predict` (moteur local) ou `predict --connect <IP>:8765`. Pas d'authentification ni de chiffrement : réservé à un réseau local de confiance.
   2. Le moteur est autonome : il analyse en permanence et tient en mémoire un instantané (mode, génération, statut, dernier signal de chaque paire, compteur de messages, occupation CPU/mémoire) et un journal plafonné à 5000 événements numérotés (alertes, infos, erreurs de source, échecs).
-  3. Chaque échange est une connexion TCP courte : l'IHM envoie une ligne JSON, le moteur répond par une ligne JSON puis ferme. Requêtes : `LireEtat { curseur }`, `Demarrer`, `Arreter { mode }`, `SauvegarderParametrages`, `ListerDossier { chemin }`, `FermetureIhm`. Message limité à 1 Mio, requête lue en 10 s au plus, 32 requêtes simultanées au plus.
+  3. Chaque échange est une connexion TCP courte : l'IHM envoie une ligne JSON, le moteur répond par une ligne JSON puis ferme. Requêtes : `LireEtat { curseur }`, `Demarrer`, `Arreter { mode }`, `SauvegarderParametrages`, `ChoisirNotifications`, `ListerDossier { chemin }`, `FermetureIhm`. Message limité à 1 Mio, requête lue en 10 s au plus, 32 requêtes simultanées au plus.
   4. L'IHM lit l'état toutes les `[ui].refresh_ms` (1 s par défaut). La réponse contient les événements de numéro supérieur au curseur, 500 au plus ; s'il en reste, l'IHM relit aussitôt. Un identifiant d'instance tiré au démarrage du moteur permet à l'IHM de détecter un redémarrage et de tout relire.
   5. Le moteur attribue la génération : chaque `Demarrer` ou `Arreter` l'incrémente et vide paires, journal et compteurs. L'IHM ignore les états d'une génération qu'elle a remplacée et adopte celle lancée par une autre IHM.
   6. La fenêtre de l'IHM s'ouvre même si le moteur ne répond pas ; les commandes restent grisées et un bandeau indique la nouvelle tentative. Elle se reconnecte seule quand le moteur revient. Le moteur continue de tourner quand l'IHM se ferme.

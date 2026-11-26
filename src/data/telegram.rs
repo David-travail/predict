@@ -1,5 +1,7 @@
+use crate::config::ChoixNotifications;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::sync::{Arc, RwLock};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info};
 
@@ -9,6 +11,27 @@ const LONGUEUR_MAX_EXTRAIT: usize = 500;
 enum CommandeTelegram {
     Message(String),
     Attendre(oneshot::Sender<()>),
+}
+
+/// Type d'une notification, filtré par `ChoixNotifications`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypeNotification {
+    Demarrage,
+    Arret,
+    PresenceIhm,
+    Retournement,
+}
+
+impl ChoixNotifications {
+    /// Indique si un type de notification est à envoyer.
+    pub fn autorise(&self, type_notification: TypeNotification) -> bool {
+        match type_notification {
+            TypeNotification::Demarrage => self.demarrage,
+            TypeNotification::Arret => self.arret,
+            TypeNotification::PresenceIhm => self.presence_ihm,
+            TypeNotification::Retournement => self.retournements,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -27,8 +50,9 @@ impl ConfigurationTelegram {
 
     /// Démarre la file d'envoi Telegram, traitée indépendamment du moteur.
     ///
+    /// Entrée : notifications à envoyer au départ (modifiables ensuite par `definir_choix`).
     /// Sortie : expéditeur borné des notifications du moteur.
-    pub fn demarrer(self) -> NotificateurTelegram {
+    pub fn demarrer(self, choix: ChoixNotifications) -> NotificateurTelegram {
         let (tx, mut rx) = mpsc::channel::<CommandeTelegram>(CAPACITE_FILE);
         tokio::spawn(async move {
             let client = match crate::data::reseau::client_http() {
@@ -52,21 +76,47 @@ impl ConfigurationTelegram {
                 }
             }
         });
-        NotificateurTelegram { tx }
+        NotificateurTelegram {
+            tx,
+            choix: Arc::new(RwLock::new(choix)),
+        }
     }
 }
 
+/// Expéditeur des notifications ; ses clones partagent la file et le choix des notifications.
 #[derive(Clone)]
 pub struct NotificateurTelegram {
     tx: mpsc::Sender<CommandeTelegram>,
+    choix: Arc<RwLock<ChoixNotifications>>,
 }
 
 impl NotificateurTelegram {
-    /// Ajoute un message à la file sans attendre la réponse du service Telegram.
+    /// Remplace, pour tous les clones, les notifications à envoyer.
+    pub fn definir_choix(&self, choix: ChoixNotifications) {
+        *self.choix.write().unwrap_or_else(|e| e.into_inner()) = choix;
+    }
+
+    /// Indique si un type de notification est actuellement à envoyer.
+    pub fn autorise(&self, type_notification: TypeNotification) -> bool {
+        self.choix
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .autorise(type_notification)
+    }
+
+    /// Ajoute un message à la file sans attendre la réponse du service Telegram ; ne fait rien
+    /// si ce type de notification est désactivé.
     ///
-    /// Entrée : texte à transmettre.
+    /// Entrées : type de la notification et texte à transmettre.
     /// Sortie : erreur si le service d'envoi est arrêté.
-    pub async fn notifier(&self, message: String) -> Result<(), String> {
+    pub async fn notifier(
+        &self,
+        type_notification: TypeNotification,
+        message: String,
+    ) -> Result<(), String> {
+        if !self.autorise(type_notification) {
+            return Ok(());
+        }
         self.tx
             .send(CommandeTelegram::Message(message))
             .await

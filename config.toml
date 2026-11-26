@@ -43,6 +43,14 @@ refresh_ms = 1000
 bot_token = ""
 chat_id = ""
 
+[telegram.notifications]
+# Notifications envoyées ; se choisissent dans l'IHM (menu « 🔔 Telegram »), qui réécrit
+# cette section. Absentes : envoyées.
+engine_start = true    # « Moteur démarré » à chaque lancement d'un mode
+engine_stop = true     # « Moteur arrêté » à l'arrêt du processus
+ui_connection = true   # connexion / déconnexion des IHM (mode --serve)
+trend_reversal = true  # retournements de tendance en temps réel
+
 # Réglages par paire : ils se gèrent dans l'IHM (Copier / Coller / Copier vers… / Sauvegarder)
 # et sont enregistrés dans parametres.toml, prioritaire sur ce fichier. [strategy] ci-dessus
 # n'est utilisé qu'en l'absence de parametres.toml.

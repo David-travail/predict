@@ -2,9 +2,9 @@
 //!
 //! Une connexion TCP par requête (voir `protocole`). Le serveur ne pousse rien.
 
-use crate::config::Parametrages;
+use crate::config::{ChoixNotifications, Parametrages};
 use crate::data::sources::Fournisseur;
-use crate::data::telegram::NotificateurTelegram;
+use crate::data::telegram::{NotificateurTelegram, TypeNotification};
 use crate::protocole::{
     ContenuDossier, ContenuEvenement, ENTREES_DOSSIER_MAX, EVENEMENTS_PAR_REPONSE, EtatMoteur,
     Evenement, ReponseMoteur, RequeteIhm, RessourcesServeur, ecrire_message, lire_ligne_limitee,
@@ -86,6 +86,8 @@ pub struct EtatInitial {
     pub parametrages: Parametrages,
     pub fournisseurs: Vec<Fournisseur>,
     pub mode: ModeExecution,
+    pub notifications: ChoixNotifications,
+    pub telegram_configure: bool,
 }
 
 /// Instantané tenu par le serveur, lu par `LireEtat`.
@@ -103,6 +105,8 @@ struct Instantane {
     journal: VecDeque<Evenement>,
     prochaine_seq: u64,
     ressources: Option<RessourcesServeur>,
+    notifications: ChoixNotifications,
+    telegram_configure: bool,
 }
 
 impl Instantane {
@@ -125,6 +129,8 @@ impl Instantane {
             journal: VecDeque::new(),
             prochaine_seq: 1,
             ressources: None,
+            notifications: initial.notifications,
+            telegram_configure: initial.telegram_configure,
         }
     }
 
@@ -210,6 +216,8 @@ impl Instantane {
             evenements,
             suite,
             ressources: self.ressources,
+            notifications: self.notifications,
+            telegram_configure: self.telegram_configure,
         }
     }
 }
@@ -222,8 +230,14 @@ struct Partage {
     ihm: Mutex<HashMap<IpAddr, Instant>>,
     /// Absence au-delà de laquelle une IHM muette est déclarée déconnectée.
     delai_absence: Duration,
-    /// Notifie l'arrivée et le départ des IHM (absent : pas de notification).
+    /// Notificateur Telegram du moteur (absent : Telegram non configuré).
     notificateur: Option<NotificateurTelegram>,
+    /// Vrai si l'arrivée et le départ des IHM sont à notifier.
+    presence_ihm: bool,
+    /// `config.toml` où enregistrer le choix des notifications (`None` : configuration intégrée).
+    chemin_config: Option<PathBuf>,
+    /// Sérialise les écritures de `config.toml` demandées par des IHM concurrentes.
+    ecriture_config: tokio::sync::Mutex<()>,
 }
 
 impl Partage {
@@ -299,10 +313,17 @@ impl Partage {
         }
     }
 
+    /// Notifie la présence d'une IHM, si demandé.
     fn notifier(&self, message: String) {
+        if !self.presence_ihm {
+            return;
+        }
         if let Some(notificateur) = self.notificateur.clone() {
             tokio::spawn(async move {
-                if let Err(erreur) = notificateur.notifier(message).await {
+                if let Err(erreur) = notificateur
+                    .notifier(TypeNotification::PresenceIhm, message)
+                    .await
+                {
                     error!("Impossible d'envoyer la notification Telegram : {erreur}");
                 }
             });
@@ -314,8 +335,12 @@ impl Partage {
 pub struct OptionsServeur {
     /// Intervalle de lecture des IHM : sert à détecter leur disparition.
     pub intervalle_ihm: Duration,
+    /// Notificateur Telegram du moteur, dont le serveur règle le choix des notifications.
+    pub notificateur: Option<NotificateurTelegram>,
     /// Notifie l'arrivée et le départ des IHM.
-    pub notificateur_presence: Option<NotificateurTelegram>,
+    pub presence_ihm: bool,
+    /// `config.toml` où enregistrer le choix des notifications.
+    pub chemin_config: Option<PathBuf>,
     /// Affiche statuts et alertes de test dans la console.
     pub console: bool,
 }
@@ -339,7 +364,10 @@ pub async fn servir(
         tx_moteur,
         ihm: Mutex::new(HashMap::new()),
         delai_absence: options.intervalle_ihm * 3 + Duration::from_secs(10),
-        notificateur: options.notificateur_presence,
+        notificateur: options.notificateur,
+        presence_ihm: options.presence_ihm,
+        chemin_config: options.chemin_config,
+        ecriture_config: tokio::sync::Mutex::new(()),
     });
     let places = Arc::new(Semaphore::new(CLIENTS_MAX));
     let mut mesure_ressources = MesureRessources::new();
@@ -529,6 +557,9 @@ async fn traiter(requete: RequeteIhm, ip: IpAddr, partage: &Partage) -> ReponseM
                 Err(_) => echec("Le moteur est arrêté.".to_string()),
             }
         }
+        RequeteIhm::ChoisirNotifications { notifications } => {
+            choisir_notifications(notifications, partage).await
+        }
         RequeteIhm::ListerDossier { chemin } => {
             let contenu = tokio::task::spawn_blocking(move || lister_dossier(&chemin))
                 .await
@@ -545,6 +576,54 @@ async fn traiter(requete: RequeteIhm, ip: IpAddr, partage: &Partage) -> ReponseM
                 message: "Au revoir.".to_string(),
                 generation: None,
             }
+        }
+    }
+}
+
+/// Applique aussitôt le choix des notifications Telegram puis l'enregistre dans `config.toml`.
+///
+/// Entrées : choix reçu de l'IHM et état partagé.
+/// Sortie : succès, ou échec si l'enregistrement est impossible (le choix reste appliqué
+/// jusqu'à l'arrêt du moteur).
+async fn choisir_notifications(
+    notifications: ChoixNotifications,
+    partage: &Partage,
+) -> ReponseMoteur {
+    // Tenu jusqu'à la fin de l'écriture : la dernière demande appliquée est la dernière écrite.
+    let _ecriture = partage.ecriture_config.lock().await;
+    partage
+        .instantane
+        .lock()
+        .expect("instantané verrouillé")
+        .notifications = notifications;
+    if let Some(notificateur) = &partage.notificateur {
+        notificateur.definir_choix(notifications);
+    }
+    info!("Notifications Telegram choisies : {notifications:?}");
+
+    let Some(chemin) = partage.chemin_config.clone() else {
+        return echec(
+            "Choix appliqué mais non enregistré : le moteur utilise sa configuration intégrée \
+             (config.toml introuvable)."
+                .to_string(),
+        );
+    };
+    let ecriture = tokio::task::spawn_blocking(move || {
+        notifications
+            .enregistrer(&chemin)
+            .map_err(|erreur| erreur.to_string())
+    })
+    .await
+    .unwrap_or_else(|erreur| Err(format!("écriture interrompue : {erreur}")));
+    match ecriture {
+        Ok(()) => ReponseMoteur::Resultat {
+            succes: true,
+            message: "Notifications Telegram enregistrées.".to_string(),
+            generation: None,
+        },
+        Err(erreur) => {
+            error!("Enregistrement des notifications Telegram impossible : {erreur}");
+            echec(format!("Choix appliqué mais non enregistré : {erreur}"))
         }
     }
 }
@@ -657,6 +736,8 @@ mod tests {
             parametrages: config.parametrages(),
             fournisseurs: config.sources_donnees.fournisseurs,
             mode: ModeExecution::TempsReel,
+            notifications: ChoixNotifications::default(),
+            telegram_configure: false,
         }
     }
 
@@ -747,6 +828,11 @@ mod tests {
         let (tx_signaux, rx_signaux) = mpsc::channel(8);
         let (tx_statut, rx_statut) = mpsc::unbounded_channel();
         let (tx_arret, rx_arret) = tokio::sync::oneshot::channel::<()>();
+        let chemin_config = std::env::temp_dir().join(format!(
+            "predict-test-config-{}.toml",
+            std::process::id()
+        ));
+        std::fs::write(&chemin_config, include_str!("../config.toml")).unwrap();
         let serveur = tokio::spawn(servir(
             listener,
             initial(),
@@ -755,7 +841,9 @@ mod tests {
             rx_statut,
             OptionsServeur {
                 intervalle_ihm: Duration::from_secs(1),
-                notificateur_presence: None,
+                notificateur: None,
+                presence_ihm: false,
+                chemin_config: Some(chemin_config.clone()),
                 console: false,
             },
             async {
@@ -770,6 +858,32 @@ mod tests {
             panic!("état attendu");
         };
         assert_eq!(etat.generation, 0);
+        assert!(etat.notifications.retournements);
+
+        let choix = ChoixNotifications {
+            retournements: false,
+            presence_ihm: false,
+            ..ChoixNotifications::default()
+        };
+        let reponse = echanger(
+            &adresse,
+            &RequeteIhm::ChoisirNotifications {
+                notifications: choix,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(reponse, ReponseMoteur::Resultat { succes: true, .. }));
+        let ReponseMoteur::Etat(etat) = echanger(&adresse, &RequeteIhm::LireEtat { curseur: 0 })
+            .await
+            .unwrap()
+        else {
+            panic!("état attendu");
+        };
+        assert_eq!(etat.notifications, choix);
+        let relue = crate::config::ConfigurationApplication::charger_config(&chemin_config).unwrap();
+        assert_eq!(relue.telegram.notifications, choix);
+        std::fs::remove_file(&chemin_config).unwrap();
 
         let reponse = echanger(
             &adresse,
